@@ -100,8 +100,13 @@ impl OutboundRouter {
                 body,
                 message_type,
             } => {
-                let stanza = build_message_stanza(to, body, message_type)?;
-                message_sent = Some((to.clone(), body.clone(), message_type.clone()));
+                let message_id = event
+                    .correlation_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| Uuid::new_v4().to_string());
+                let stanza =
+                    build_message_stanza(to, body, message_type, Some(message_id.as_str()))?;
+                message_sent = Some((message_id, to.clone(), body.clone(), message_type.clone()));
                 Some(stanza)
             }
             EventPayload::PresenceSetRequested { show, status } => {
@@ -148,8 +153,8 @@ impl OutboundRouter {
                 .await
                 .map_err(|_| OutboundRouterError::WireSendFailed)?;
 
-            if let Some((to, body, message_type)) = message_sent {
-                self.emit_message_sent(event, &to, &body, &message_type);
+            if let Some((message_id, to, body, message_type)) = message_sent {
+                self.emit_message_sent(event, &message_id, &to, &body, &message_type);
             }
 
             if let Some((show, status)) = own_presence_changed {
@@ -164,6 +169,7 @@ impl OutboundRouter {
     fn emit_message_sent(
         &self,
         event: &Event,
+        message_id: &str,
         to: &str,
         body: &str,
         message_type: &CoreMessageType,
@@ -174,7 +180,7 @@ impl OutboundRouter {
         };
 
         let msg = ChatMessage {
-            id: Uuid::new_v4().to_string(),
+            id: message_id.to_string(),
             from: String::new(),
             to: to.to_string(),
             body: body.to_string(),
@@ -222,6 +228,7 @@ fn build_message_stanza(
     to: &str,
     body: &str,
     message_type: &CoreMessageType,
+    message_id: Option<&str>,
 ) -> Result<Stanza, OutboundRouterError> {
     let to_jid: jid::Jid = to
         .parse()
@@ -236,7 +243,11 @@ fn build_message_stanza(
     };
 
     let mut msg = Message::new_with_type(xmpp_type, Some(to_jid));
-    msg.id = Some(xmpp_parsers::message::Id(Uuid::new_v4().to_string()));
+    msg.id = Some(xmpp_parsers::message::Id(
+        message_id
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+    ));
     msg.bodies.insert(Lang::new(), body.to_string());
 
     Ok(Stanza::Message(Box::new(msg)))
@@ -445,7 +456,8 @@ mod tests {
     #[test]
     fn builds_chat_message_stanza() {
         let stanza =
-            build_message_stanza("bob@example.com", "Hello!", &CoreMessageType::Chat).unwrap();
+            build_message_stanza("bob@example.com", "Hello!", &CoreMessageType::Chat, None)
+                .unwrap();
         let Stanza::Message(msg) = &stanza else {
             panic!("expected message stanza");
         };
@@ -464,6 +476,7 @@ mod tests {
             "room@conference.example.com",
             "Hi room!",
             &CoreMessageType::Groupchat,
+            None,
         )
         .unwrap();
         let Stanza::Message(msg) = &stanza else {
@@ -474,7 +487,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_jid_in_message() {
-        let result = build_message_stanza("not a jid!!!", "body", &CoreMessageType::Chat);
+        let result = build_message_stanza("not a jid!!!", "body", &CoreMessageType::Chat, None);
         assert!(result.is_err());
     }
 
@@ -688,7 +701,7 @@ mod tests {
     #[test]
     fn all_stanzas_serialize_to_valid_xml() {
         let stanzas = vec![
-            build_message_stanza("bob@example.com", "test", &CoreMessageType::Chat).unwrap(),
+            build_message_stanza("bob@example.com", "test", &CoreMessageType::Chat, None).unwrap(),
             build_presence_stanza(&CorePresenceShow::Available, None),
             build_presence_stanza(&CorePresenceShow::Away, Some("brb")),
             build_presence_stanza(&CorePresenceShow::Unavailable, None),
@@ -917,6 +930,57 @@ mod integration_tests {
 
         assert_eq!(event.channel.as_str(), "xmpp.message.sent");
         assert!(matches!(event.payload, EventPayload::MessageSent { .. }));
+
+        _handle.abort();
+    }
+
+    #[tokio::test]
+    async fn message_send_uses_correlation_id_for_message_ids() {
+        let (router, mut rx, event_bus) = make_router();
+
+        let mut sent_sub = event_bus
+            .subscribe("xmpp.message.sent")
+            .expect("subscribe should succeed");
+
+        let _handle = tokio::spawn(async move { router.run().await });
+        yield_to_router().await;
+
+        let correlation_id = Uuid::new_v4();
+        let event = Event::with_correlation(
+            Channel::new("ui.message.send").expect("valid channel"),
+            EventSource::Ui(UiTarget::Tui),
+            EventPayload::MessageSendRequested {
+                to: "bob@example.com".to_string(),
+                body: "Correlated".to_string(),
+                message_type: CoreMessageType::Chat,
+            },
+            correlation_id,
+        );
+        event_bus.publish(event).expect("publish should succeed");
+
+        let bytes = timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("timed out waiting for wire bytes")
+            .expect("channel should not be closed");
+
+        let stanza = Stanza::parse(&bytes).expect("wire bytes should parse as stanza");
+        let Stanza::Message(msg) = stanza else {
+            panic!("expected message stanza");
+        };
+        assert_eq!(msg.id.map(|id| id.0), Some(correlation_id.to_string()));
+
+        let sent_event = timeout(Duration::from_millis(200), sent_sub.recv())
+            .await
+            .expect("timed out waiting for message.sent event")
+            .expect("should receive event");
+
+        assert_eq!(sent_event.correlation_id, Some(correlation_id));
+        assert!(matches!(
+            sent_event.payload,
+            EventPayload::MessageSent {
+                message: ChatMessage { ref id, .. },
+            } if id == &correlation_id.to_string()
+        ));
 
         _handle.abort();
     }

@@ -144,10 +144,10 @@ impl<D: Database> MessageManager<D> {
     }
 
     pub async fn send_message(&self, to: &str, body: &str) -> Result<ChatMessage, MessagingError> {
-        let id = Uuid::new_v4().to_string();
+        let id = Uuid::new_v4();
         let now = Utc::now();
         let message = ChatMessage {
-            id: id.clone(),
+            id: id.to_string(),
             from: String::new(), // filled by outbound router with our JID
             to: to.to_string(),
             body: body.to_string(),
@@ -160,7 +160,7 @@ impl<D: Database> MessageManager<D> {
 
         #[cfg(feature = "native")]
         {
-            let _ = self.event_bus.publish(Event::new(
+            let _ = self.event_bus.publish(Event::with_correlation(
                 Channel::new("ui.message.send").unwrap(),
                 EventSource::System("messaging".into()),
                 EventPayload::MessageSendRequested {
@@ -168,6 +168,7 @@ impl<D: Database> MessageManager<D> {
                     body: body.to_string(),
                     message_type: MessageType::Chat,
                 },
+                id,
             ));
         }
 
@@ -433,6 +434,10 @@ mod tests {
                 ..
             } if to == "bob@example.com" && body == "Hello Bob!"
         ));
+        assert_eq!(
+            received.correlation_id,
+            Some(Uuid::parse_str(&msg.id).expect("message id should be a UUID"))
+        );
     }
 
     #[tokio::test]
