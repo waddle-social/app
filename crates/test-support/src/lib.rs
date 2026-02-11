@@ -31,6 +31,10 @@ pub mod fixtures {
         read_or_panic(Path::new("config").join(name))
     }
 
+    pub fn messages(name: &str) -> String {
+        read_or_panic(Path::new("messages").join(name))
+    }
+
     fn read_or_panic(relative: impl AsRef<Path>) -> String {
         let relative = relative.as_ref();
         read(relative).unwrap_or_else(|error| {
@@ -71,5 +75,13 @@ mod tests {
         let toml: toml::Value =
             toml::from_str(&config).expect("minimal-config.toml should be valid toml");
         assert!(toml.is_table());
+    }
+
+    #[test]
+    fn loads_messages_fixture() {
+        let messages = fixtures::messages("conversation-sequence.json");
+        let json: serde_json::Value = serde_json::from_str(&messages)
+            .expect("conversation-sequence.json should be valid json");
+        assert!(json.is_array());
     }
 }
