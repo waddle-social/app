@@ -15,9 +15,15 @@ web = ["waddle-core/web", "waddle-storage/web", "waddle-xmpp/web"]
 waddle-core = { workspace = true, default-features = false }
 waddle-storage = { workspace = true, default-features = false }
 waddle-xmpp = { workspace = true, default-features = false }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }
 tokio-test = { workspace = true }
 mockall = { workspace = true }
 tracing-test = { workspace = true }

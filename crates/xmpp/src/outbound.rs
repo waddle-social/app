@@ -7,10 +7,12 @@ use uuid::Uuid;
 use xmpp_parsers::chatstates::ChatState as XmppChatState;
 use xmpp_parsers::iq::Iq;
 use xmpp_parsers::jid;
+use xmpp_parsers::mam;
 use xmpp_parsers::message::{Lang, Message, MessageType as XmppMessageType};
 use xmpp_parsers::muc::Muc;
 use xmpp_parsers::presence::{Presence, Show, Type as PresenceType};
 use xmpp_parsers::roster;
+use xmpp_parsers::rsm;
 
 use waddle_core::event::{
     ChatMessage, ChatState as CoreChatState, Event, EventPayload, EventSource,
@@ -138,6 +140,12 @@ impl OutboundRouter {
             EventPayload::ChatStateSendRequested { to, state } => {
                 Some(build_chat_state_stanza(to, state)?)
             }
+            EventPayload::MamQueryRequested {
+                query_id,
+                after,
+                before,
+                max,
+            } => Some(build_mam_query_stanza(query_id, after, before, *max)),
             _ => None,
         };
 
@@ -411,6 +419,31 @@ fn build_muc_message_stanza(room: &str, body: &str) -> Result<Stanza, OutboundRo
     msg.bodies.insert(Lang::new(), body.to_string());
 
     Ok(Stanza::Message(Box::new(msg)))
+}
+
+fn build_mam_query_stanza(
+    query_id: &str,
+    after: &Option<String>,
+    before: &Option<String>,
+    max: u32,
+) -> Stanza {
+    let set = rsm::SetQuery {
+        max: Some(max as usize),
+        after: after.clone(),
+        before: before.clone(),
+        index: None,
+    };
+
+    let query = mam::Query {
+        queryid: Some(mam::QueryId(query_id.to_string())),
+        node: None,
+        form: None,
+        set: Some(set),
+        flip_page: false,
+    };
+
+    let iq = Iq::from_set(Uuid::new_v4().to_string(), query);
+    Stanza::Iq(Box::new(iq))
 }
 
 fn build_chat_state_stanza(to: &str, state: &CoreChatState) -> Result<Stanza, OutboundRouterError> {

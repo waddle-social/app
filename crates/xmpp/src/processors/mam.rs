@@ -103,21 +103,27 @@ impl StanzaProcessor for MamProcessor {
             }
             Stanza::Iq(iq) => {
                 if let Iq::Result {
+                    id,
                     payload: Some(payload),
                     ..
                 } = iq.as_ref()
                 {
                     if let Ok(fin) = mam::Fin::try_from(payload.clone()) {
-                        debug!(complete = fin.complete, "MAM query finished");
+                        let last_id = fin.set.last.clone();
+                        debug!(
+                            complete = fin.complete,
+                            last_id = ?last_id,
+                            "MAM query finished"
+                        );
                         #[cfg(feature = "native")]
                         {
                             let _ = self.event_bus.publish(Event::new(
                                 Channel::new("xmpp.mam.result.received").unwrap(),
                                 EventSource::Xmpp,
-                                EventPayload::MamResultReceived {
-                                    query_id: String::new(),
-                                    messages: vec![],
+                                EventPayload::MamFinReceived {
+                                    iq_id: id.clone(),
                                     complete: fin.complete,
+                                    last_id,
                                 },
                             ));
                         }

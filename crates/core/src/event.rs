@@ -251,6 +251,11 @@ pub enum EventPayload {
         messages: Vec<ChatMessage>,
         complete: bool,
     },
+    MamFinReceived {
+        iq_id: String,
+        complete: bool,
+        last_id: Option<String>,
+    },
 
     // ── XMPP Debug events ────────────────────────────────────────
     RawStanzaReceived {
@@ -330,6 +335,12 @@ pub enum EventPayload {
     ChatStateSendRequested {
         to: String,
         state: ChatState,
+    },
+    MamQueryRequested {
+        query_id: String,
+        after: Option<String>,
+        before: Option<String>,
+        max: u32,
     },
 
     // ── Plugin events ────────────────────────────────────────────
