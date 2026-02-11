@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+#[cfg(feature = "native")]
+use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -135,16 +137,108 @@ fn message_type_to_str(mt: &MessageType) -> &'static str {
     }
 }
 
+#[cfg(feature = "native")]
+const OFFLINE_STATUS_PENDING: &str = "pending";
+#[cfg(feature = "native")]
+const OFFLINE_STATUS_SENT: &str = "sent";
+#[cfg(feature = "native")]
+const OFFLINE_STATUS_CONFIRMED: &str = "confirmed";
+#[cfg(feature = "native")]
+const OFFLINE_STATUS_FAILED: &str = "failed";
+#[cfg(feature = "native")]
+const OFFLINE_SOURCE: &str = "offline";
+
+#[cfg(feature = "native")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct QueuedOutboundEvent {
+    channel: String,
+    payload: EventPayload,
+    correlation_id: Option<Uuid>,
+}
+
+#[cfg(feature = "native")]
+struct StoredOfflineQueueItem {
+    id: i64,
+    stanza_type: String,
+    payload: String,
+    status: String,
+}
+
+#[cfg(feature = "native")]
+impl FromRow for StoredOfflineQueueItem {
+    fn from_row(row: &Row) -> Result<Self, StorageError> {
+        let id = match row.get(0) {
+            Some(SqlValue::Integer(v)) => *v,
+            _ => return Err(StorageError::QueryFailed("missing id column".to_string())),
+        };
+        let stanza_type = match row.get(1) {
+            Some(SqlValue::Text(v)) => v.clone(),
+            _ => {
+                return Err(StorageError::QueryFailed(
+                    "missing stanza_type column".to_string(),
+                ));
+            }
+        };
+        let payload = match row.get(2) {
+            Some(SqlValue::Text(v)) => v.clone(),
+            _ => {
+                return Err(StorageError::QueryFailed(
+                    "missing payload column".to_string(),
+                ));
+            }
+        };
+        let status = match row.get(3) {
+            Some(SqlValue::Text(v)) => v.clone(),
+            _ => {
+                return Err(StorageError::QueryFailed(
+                    "missing status column".to_string(),
+                ));
+            }
+        };
+        Ok(Self {
+            id,
+            stanza_type,
+            payload,
+            status,
+        })
+    }
+}
+
+#[cfg(feature = "native")]
+fn command_stanza_type(payload: &EventPayload) -> Option<&'static str> {
+    match payload {
+        EventPayload::MessageSendRequested { .. }
+        | EventPayload::MucSendRequested { .. }
+        | EventPayload::ChatStateSendRequested { .. } => Some("message"),
+        EventPayload::PresenceSetRequested { .. }
+        | EventPayload::SubscriptionRespondRequested { .. }
+        | EventPayload::SubscriptionSendRequested { .. }
+        | EventPayload::MucJoinRequested { .. }
+        | EventPayload::MucLeaveRequested { .. } => Some("presence"),
+        EventPayload::RosterAddRequested { .. }
+        | EventPayload::RosterUpdateRequested { .. }
+        | EventPayload::RosterRemoveRequested { .. }
+        | EventPayload::RosterFetchRequested => Some("iq"),
+        _ => None,
+    }
+}
+
 pub struct MessageManager<D: Database> {
     db: Arc<D>,
     #[cfg(feature = "native")]
     event_bus: Arc<dyn EventBus>,
+    #[cfg(feature = "native")]
+    is_online: RwLock<bool>,
 }
 
 impl<D: Database> MessageManager<D> {
     #[cfg(feature = "native")]
     pub fn new(db: Arc<D>, event_bus: Arc<dyn EventBus>) -> Self {
-        Self { db, event_bus }
+        Self {
+            db,
+            event_bus,
+            is_online: RwLock::new(false),
+        }
     }
 
     pub async fn send_message(&self, to: &str, body: &str) -> Result<ChatMessage, MessagingError> {
@@ -164,16 +258,23 @@ impl<D: Database> MessageManager<D> {
 
         #[cfg(feature = "native")]
         {
-            let _ = self.event_bus.publish(Event::with_correlation(
-                Channel::new("ui.message.send").unwrap(),
-                EventSource::System("messaging".into()),
-                EventPayload::MessageSendRequested {
-                    to: to.to_string(),
-                    body: body.to_string(),
-                    message_type: MessageType::Chat,
-                },
-                id,
-            ));
+            let payload = EventPayload::MessageSendRequested {
+                to: to.to_string(),
+                body: body.to_string(),
+                message_type: MessageType::Chat,
+            };
+
+            if self.is_online() {
+                let _ = self.event_bus.publish(Event::with_correlation(
+                    Channel::new("ui.message.send").unwrap(),
+                    EventSource::System("messaging".into()),
+                    payload,
+                    id,
+                ));
+            } else {
+                self.enqueue_command_event("ui.message.send", payload, Some(id))
+                    .await?;
+            }
         }
 
         Ok(message)
@@ -182,14 +283,21 @@ impl<D: Database> MessageManager<D> {
     pub async fn send_chat_state(&self, to: &str, state: ChatState) -> Result<(), MessagingError> {
         #[cfg(feature = "native")]
         {
-            let _ = self.event_bus.publish(Event::new(
-                Channel::new("ui.chatstate.send").unwrap(),
-                EventSource::System("messaging".into()),
-                EventPayload::ChatStateSendRequested {
-                    to: to.to_string(),
-                    state,
-                },
-            ));
+            let payload = EventPayload::ChatStateSendRequested {
+                to: to.to_string(),
+                state,
+            };
+
+            if self.is_online() {
+                let _ = self.event_bus.publish(Event::new(
+                    Channel::new("ui.chatstate.send").unwrap(),
+                    EventSource::System("messaging".into()),
+                    payload,
+                ));
+            } else {
+                self.enqueue_command_event("ui.chatstate.send", payload, None)
+                    .await?;
+            }
         }
         Ok(())
     }
@@ -264,8 +372,330 @@ impl<D: Database> MessageManager<D> {
     }
 
     #[cfg(feature = "native")]
+    fn is_online(&self) -> bool {
+        *self.is_online.read().unwrap()
+    }
+
+    #[cfg(feature = "native")]
+    fn set_online(&self, online: bool) -> bool {
+        let mut state = self.is_online.write().unwrap();
+        let previous = *state;
+        *state = online;
+        previous
+    }
+
+    #[cfg(feature = "native")]
+    async fn enqueue_command_event(
+        &self,
+        channel: &str,
+        payload: EventPayload,
+        correlation_id: Option<Uuid>,
+    ) -> Result<(), MessagingError> {
+        let Some(stanza_type) = command_stanza_type(&payload) else {
+            return Ok(());
+        };
+
+        let resolved_correlation = if matches!(&payload, EventPayload::MessageSendRequested { .. })
+            && correlation_id.is_none()
+        {
+            Some(Uuid::new_v4())
+        } else {
+            correlation_id
+        };
+
+        if let EventPayload::MessageSendRequested {
+            to,
+            body,
+            message_type,
+        } = &payload
+        {
+            let message = ChatMessage {
+                id: resolved_correlation
+                    .unwrap_or_else(Uuid::new_v4)
+                    .to_string(),
+                from: String::new(),
+                to: to.clone(),
+                body: body.clone(),
+                timestamp: Utc::now(),
+                message_type: message_type.clone(),
+                thread: None,
+            };
+            self.persist_message(&message).await?;
+        }
+
+        let queued = QueuedOutboundEvent {
+            channel: channel.to_string(),
+            payload,
+            correlation_id: resolved_correlation,
+        };
+        let payload_json = serde_json::to_string(&queued)
+            .map_err(|e| MessagingError::SendFailed(format!("queue serialization failed: {e}")))?;
+        let created_at = Utc::now().to_rfc3339();
+        let status = OFFLINE_STATUS_PENDING.to_string();
+        let stanza_type_s = stanza_type.to_string();
+
+        self.db
+            .execute(
+                "INSERT INTO offline_queue (stanza_type, payload, created_at, status) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                &[&stanza_type_s, &payload_json, &created_at, &status],
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    #[cfg(feature = "native")]
+    async fn load_offline_queue_by_status(
+        &self,
+        status: &str,
+    ) -> Result<Vec<StoredOfflineQueueItem>, MessagingError> {
+        let status_s = status.to_string();
+        self.db
+            .query(
+                "SELECT id, stanza_type, payload, status \
+                 FROM offline_queue \
+                 WHERE status = ?1 \
+                 ORDER BY id ASC",
+                &[&status_s],
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    #[cfg(feature = "native")]
+    async fn load_message_queue_candidates(
+        &self,
+    ) -> Result<Vec<StoredOfflineQueueItem>, MessagingError> {
+        self.db
+            .query(
+                "SELECT id, stanza_type, payload, status \
+                 FROM offline_queue \
+                 WHERE stanza_type = 'message' AND status != 'confirmed' \
+                 ORDER BY id ASC",
+                &[],
+            )
+            .await
+            .map_err(Into::into)
+    }
+
+    #[cfg(feature = "native")]
+    async fn update_queue_status(&self, id: i64, status: &str) -> Result<(), MessagingError> {
+        let status_s = status.to_string();
+        self.db
+            .execute(
+                "UPDATE offline_queue SET status = ?1 WHERE id = ?2",
+                &[&status_s, &id],
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "native")]
+    async fn drain_offline_queue(&self) -> Result<(), MessagingError> {
+        let pending_items = self
+            .load_offline_queue_by_status(OFFLINE_STATUS_PENDING)
+            .await?;
+
+        for item in pending_items {
+            let queued: QueuedOutboundEvent = match serde_json::from_str(&item.payload) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    error!(
+                        queue_id = item.id,
+                        error = %error,
+                        "failed to deserialize offline queue item"
+                    );
+                    let _ = self
+                        .update_queue_status(item.id, OFFLINE_STATUS_FAILED)
+                        .await;
+                    continue;
+                }
+            };
+
+            let channel = match Channel::new(&queued.channel) {
+                Ok(channel) => channel,
+                Err(error) => {
+                    error!(
+                        queue_id = item.id,
+                        channel = %queued.channel,
+                        error = %error,
+                        "invalid queued channel"
+                    );
+                    let _ = self
+                        .update_queue_status(item.id, OFFLINE_STATUS_FAILED)
+                        .await;
+                    continue;
+                }
+            };
+
+            let source = EventSource::System(OFFLINE_SOURCE.to_string());
+            let event = if let Some(correlation_id) = queued.correlation_id {
+                Event::with_correlation(channel, source, queued.payload, correlation_id)
+            } else {
+                Event::new(channel, source, queued.payload)
+            };
+
+            if let Err(error) = self.event_bus.publish(event) {
+                error!(
+                    queue_id = item.id,
+                    error = %error,
+                    "failed to publish queued offline command"
+                );
+                let _ = self
+                    .update_queue_status(item.id, OFFLINE_STATUS_FAILED)
+                    .await;
+                continue;
+            }
+
+            if item.stanza_type != "message" {
+                if let Err(error) = self.update_queue_status(item.id, OFFLINE_STATUS_SENT).await {
+                    error!(
+                        queue_id = item.id,
+                        error = %error,
+                        "failed to update queued command status to sent"
+                    );
+                } else if let Err(error) = self
+                    .update_queue_status(item.id, OFFLINE_STATUS_CONFIRMED)
+                    .await
+                {
+                    error!(
+                        queue_id = item.id,
+                        error = %error,
+                        "failed to update queued command status to confirmed"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "native")]
+    async fn update_message_queue_status_by_id(
+        &self,
+        message_id: &str,
+        from_statuses: &[&str],
+        to_status: &str,
+    ) -> Result<bool, MessagingError> {
+        let candidates = self.load_message_queue_candidates().await?;
+
+        for item in candidates {
+            if !from_statuses.contains(&item.status.as_str()) {
+                continue;
+            }
+
+            let Ok(queued) = serde_json::from_str::<QueuedOutboundEvent>(&item.payload) else {
+                continue;
+            };
+
+            let queued_id = queued.correlation_id.map(|id| id.to_string());
+            if queued_id.as_deref() == Some(message_id) {
+                self.update_queue_status(item.id, to_status).await?;
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    #[cfg(feature = "native")]
+    async fn update_message_queue_status_by_content(
+        &self,
+        to: &str,
+        body: &str,
+        from_statuses: &[&str],
+        to_status: &str,
+    ) -> Result<bool, MessagingError> {
+        let candidates = self.load_message_queue_candidates().await?;
+
+        for item in candidates {
+            if !from_statuses.contains(&item.status.as_str()) {
+                continue;
+            }
+
+            let Ok(queued) = serde_json::from_str::<QueuedOutboundEvent>(&item.payload) else {
+                continue;
+            };
+
+            if let EventPayload::MessageSendRequested {
+                to: queued_to,
+                body: queued_body,
+                ..
+            } = queued.payload
+            {
+                if queued_to == to && queued_body == body {
+                    self.update_queue_status(item.id, to_status).await?;
+                    return Ok(true);
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
+    #[cfg(feature = "native")]
+    fn emit_system_transition(&self, channel: &str, payload: EventPayload) {
+        let Ok(channel) = Channel::new(channel) else {
+            return;
+        };
+        let _ = self.event_bus.publish(Event::new(
+            channel,
+            EventSource::System(OFFLINE_SOURCE.to_string()),
+            payload,
+        ));
+    }
+
+    #[cfg(feature = "native")]
     pub async fn handle_event(&self, event: &Event) {
         match &event.payload {
+            EventPayload::ConnectionEstablished { .. } => {
+                let was_online = self.set_online(true);
+                if !was_online {
+                    self.emit_system_transition("system.coming_online", EventPayload::ComingOnline);
+                }
+                if let Err(error) = self.drain_offline_queue().await {
+                    error!(error = %error, "failed to drain offline queue");
+                }
+            }
+            EventPayload::ConnectionLost { .. } => {
+                let was_online = self.set_online(false);
+                if was_online {
+                    self.emit_system_transition("system.going_offline", EventPayload::GoingOffline);
+                }
+            }
+            EventPayload::MessageSendRequested { .. }
+            | EventPayload::PresenceSetRequested { .. }
+            | EventPayload::RosterAddRequested { .. }
+            | EventPayload::RosterUpdateRequested { .. }
+            | EventPayload::RosterRemoveRequested { .. }
+            | EventPayload::RosterFetchRequested
+            | EventPayload::SubscriptionRespondRequested { .. }
+            | EventPayload::SubscriptionSendRequested { .. }
+            | EventPayload::MucJoinRequested { .. }
+            | EventPayload::MucLeaveRequested { .. }
+            | EventPayload::MucSendRequested { .. }
+            | EventPayload::ChatStateSendRequested { .. } => {
+                if self.is_online() {
+                    return;
+                }
+
+                if matches!(event.source, EventSource::System(ref source) if source == OFFLINE_SOURCE)
+                {
+                    return;
+                }
+
+                if let Err(error) = self
+                    .enqueue_command_event(
+                        event.channel.as_str(),
+                        event.payload.clone(),
+                        event.correlation_id,
+                    )
+                    .await
+                {
+                    error!(error = %error, "failed to enqueue offline command event");
+                }
+            }
             EventPayload::MessageReceived { message } => {
                 debug!(
                     id = %message.id,
@@ -285,9 +715,71 @@ impl<D: Database> MessageManager<D> {
                 if let Err(e) = self.persist_message(message).await {
                     error!(error = %e, "failed to persist sent message");
                 }
+                if let Err(error) = self
+                    .update_message_queue_status_by_id(
+                        &message.id,
+                        &[OFFLINE_STATUS_PENDING],
+                        OFFLINE_STATUS_SENT,
+                    )
+                    .await
+                {
+                    error!(error = %error, "failed to update queued message to sent");
+                }
             }
             EventPayload::MessageDelivered { id, to } => {
                 debug!(id = %id, to = %to, "delivery receipt received");
+                if let Err(error) = self
+                    .update_message_queue_status_by_id(
+                        id,
+                        &[OFFLINE_STATUS_PENDING, OFFLINE_STATUS_SENT],
+                        OFFLINE_STATUS_CONFIRMED,
+                    )
+                    .await
+                {
+                    error!(error = %error, "failed to update queued message to confirmed");
+                }
+            }
+            EventPayload::MamResultReceived { messages, .. } => {
+                for message in messages {
+                    let confirmed_by_id = match self
+                        .update_message_queue_status_by_id(
+                            &message.id,
+                            &[OFFLINE_STATUS_PENDING, OFFLINE_STATUS_SENT],
+                            OFFLINE_STATUS_CONFIRMED,
+                        )
+                        .await
+                    {
+                        Ok(updated) => updated,
+                        Err(error) => {
+                            error!(
+                                error = %error,
+                                message_id = %message.id,
+                                "failed to reconcile queued message by id"
+                            );
+                            false
+                        }
+                    };
+
+                    if confirmed_by_id {
+                        continue;
+                    }
+
+                    if let Err(error) = self
+                        .update_message_queue_status_by_content(
+                            &message.to,
+                            &message.body,
+                            &[OFFLINE_STATUS_SENT],
+                            OFFLINE_STATUS_CONFIRMED,
+                        )
+                        .await
+                    {
+                        error!(
+                            error = %error,
+                            to = %message.to,
+                            "failed to reconcile queued message with MAM content"
+                        );
+                    }
+                }
             }
             EventPayload::ChatStateReceived { from, state } => {
                 debug!(from = %from, ?state, "chat state received");
@@ -300,7 +792,7 @@ impl<D: Database> MessageManager<D> {
     pub async fn run(self: Arc<Self>) -> Result<(), MessagingError> {
         let mut sub = self
             .event_bus
-            .subscribe("{system,xmpp}.**")
+            .subscribe("{system,xmpp,ui}.**")
             .map_err(|e| MessagingError::EventBus(e.to_string()))?;
 
         loop {
@@ -743,6 +1235,16 @@ mod tests {
         }
     }
 
+    async fn set_connection_online<D: Database>(manager: &MessageManager<D>) {
+        let event = make_event(
+            "system.connection.established",
+            EventPayload::ConnectionEstablished {
+                jid: "alice@example.com".to_string(),
+            },
+        );
+        manager.handle_event(&event).await;
+    }
+
     #[tokio::test]
     async fn get_messages_empty() {
         let (manager, _, _dir) = setup().await;
@@ -757,6 +1259,7 @@ mod tests {
     async fn send_message_persists_and_emits_event() {
         let (manager, event_bus, _dir) = setup().await;
         let mut sub = event_bus.subscribe("ui.**").unwrap();
+        set_connection_online(manager.as_ref()).await;
 
         let msg = manager
             .send_message("bob@example.com", "Hello Bob!")
@@ -947,6 +1450,7 @@ mod tests {
     async fn send_chat_state_emits_event() {
         let (manager, event_bus, _dir) = setup().await;
         let mut sub = event_bus.subscribe("ui.**").unwrap();
+        set_connection_online(manager.as_ref()).await;
 
         manager
             .send_chat_state("bob@example.com", ChatState::Composing)
@@ -1123,6 +1627,218 @@ mod tests {
             .unwrap();
 
         assert_eq!(messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn send_message_offline_enqueues_without_emitting_ui_event() {
+        let (manager, event_bus, _dir) = setup().await;
+        let mut sub = event_bus.subscribe("ui.message.send").unwrap();
+
+        let message = manager
+            .send_message("bob@example.com", "queued while offline")
+            .await
+            .unwrap();
+
+        let ui_event =
+            tokio::time::timeout(std::time::Duration::from_millis(100), sub.recv()).await;
+        assert!(
+            ui_event.is_err(),
+            "offline send should not publish ui.message.send"
+        );
+
+        let rows: Vec<Row> = manager
+            .db
+            .query(
+                "SELECT stanza_type, status FROM offline_queue ORDER BY id ASC",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&SqlValue::Text("message".to_string())));
+        assert_eq!(rows[0].get(1), Some(&SqlValue::Text("pending".to_string())));
+
+        let stored = manager
+            .get_messages("bob@example.com", 50, None)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, message.id);
+    }
+
+    #[tokio::test]
+    async fn reconnect_drains_offline_queue_fifo_and_marks_sent() {
+        let (manager, event_bus, _dir) = setup().await;
+
+        let first = manager
+            .send_message("bob@example.com", "first queued")
+            .await
+            .unwrap();
+        let second = manager
+            .send_message("carol@example.com", "second queued")
+            .await
+            .unwrap();
+
+        let mut sub = event_bus.subscribe("ui.message.send").unwrap();
+        set_connection_online(manager.as_ref()).await;
+
+        let first_event = tokio::time::timeout(std::time::Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out waiting for first drained item")
+            .expect("expected first drained item");
+        let second_event = tokio::time::timeout(std::time::Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out waiting for second drained item")
+            .expect("expected second drained item");
+
+        assert!(matches!(
+            first_event.payload,
+            EventPayload::MessageSendRequested { ref body, .. } if body == "first queued"
+        ));
+        assert!(matches!(
+            second_event.payload,
+            EventPayload::MessageSendRequested { ref body, .. } if body == "second queued"
+        ));
+
+        manager
+            .handle_event(&make_event(
+                "xmpp.message.sent",
+                EventPayload::MessageSent {
+                    message: make_chat_message(
+                        &first.id,
+                        "alice@example.com",
+                        "bob@example.com",
+                        "first queued",
+                    ),
+                },
+            ))
+            .await;
+
+        manager
+            .handle_event(&make_event(
+                "xmpp.message.sent",
+                EventPayload::MessageSent {
+                    message: make_chat_message(
+                        &second.id,
+                        "alice@example.com",
+                        "carol@example.com",
+                        "second queued",
+                    ),
+                },
+            ))
+            .await;
+
+        let rows: Vec<Row> = manager
+            .db
+            .query("SELECT status FROM offline_queue ORDER BY id ASC", &[])
+            .await
+            .unwrap();
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get(0), Some(&SqlValue::Text("sent".to_string())));
+        assert_eq!(rows[1].get(0), Some(&SqlValue::Text("sent".to_string())));
+    }
+
+    #[tokio::test]
+    async fn delivery_receipt_marks_queued_message_confirmed() {
+        let (manager, _event_bus, _dir) = setup().await;
+
+        let queued = manager
+            .send_message("bob@example.com", "needs confirmation")
+            .await
+            .unwrap();
+        set_connection_online(manager.as_ref()).await;
+
+        manager
+            .handle_event(&make_event(
+                "xmpp.message.sent",
+                EventPayload::MessageSent {
+                    message: make_chat_message(
+                        &queued.id,
+                        "alice@example.com",
+                        "bob@example.com",
+                        "needs confirmation",
+                    ),
+                },
+            ))
+            .await;
+
+        manager
+            .handle_event(&make_event(
+                "xmpp.message.delivered",
+                EventPayload::MessageDelivered {
+                    id: queued.id.clone(),
+                    to: "bob@example.com".to_string(),
+                },
+            ))
+            .await;
+
+        let row: Row = manager
+            .db
+            .query_one(
+                "SELECT status FROM offline_queue ORDER BY id ASC LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get(0), Some(&SqlValue::Text("confirmed".to_string())));
+    }
+
+    #[tokio::test]
+    async fn mam_result_reconciles_sent_queue_item_by_content() {
+        let (manager, _event_bus, _dir) = setup().await;
+
+        let queued = manager
+            .send_message("bob@example.com", "reconcile me")
+            .await
+            .unwrap();
+        set_connection_online(manager.as_ref()).await;
+
+        manager
+            .handle_event(&make_event(
+                "xmpp.message.sent",
+                EventPayload::MessageSent {
+                    message: make_chat_message(
+                        &queued.id,
+                        "alice@example.com",
+                        "bob@example.com",
+                        "reconcile me",
+                    ),
+                },
+            ))
+            .await;
+
+        let mam_message = ChatMessage {
+            id: "archive-id-42".to_string(),
+            from: "alice@example.com".to_string(),
+            to: "bob@example.com".to_string(),
+            body: "reconcile me".to_string(),
+            timestamp: Utc::now(),
+            message_type: MessageType::Chat,
+            thread: None,
+        };
+
+        manager
+            .handle_event(&make_event(
+                "xmpp.mam.result.received",
+                EventPayload::MamResultReceived {
+                    query_id: "q1".to_string(),
+                    messages: vec![mam_message],
+                    complete: true,
+                },
+            ))
+            .await;
+
+        let row: Row = manager
+            .db
+            .query_one(
+                "SELECT status FROM offline_queue ORDER BY id ASC LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(row.get(0), Some(&SqlValue::Text("confirmed".to_string())));
     }
 }
 

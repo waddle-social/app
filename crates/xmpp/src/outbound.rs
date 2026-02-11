@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 #[cfg(feature = "native")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(feature = "native")]
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
@@ -37,12 +40,17 @@ pub fn stanza_channel(buffer: usize) -> (StanzaSender, StanzaReceiver) {
     mpsc::channel(buffer)
 }
 
+#[cfg(feature = "native")]
+const OFFLINE_DRAIN_SOURCE: &str = "offline";
+
 pub struct OutboundRouter {
     #[cfg(feature = "native")]
     event_bus: Arc<dyn EventBus>,
     pipeline: Arc<StanzaPipeline>,
     #[cfg(feature = "native")]
     wire_sender: StanzaSender,
+    #[cfg(feature = "native")]
+    is_online: AtomicBool,
 }
 
 impl OutboundRouter {
@@ -56,6 +64,7 @@ impl OutboundRouter {
             event_bus,
             pipeline,
             wire_sender,
+            is_online: AtomicBool::new(false),
         }
     }
 
@@ -63,7 +72,7 @@ impl OutboundRouter {
     pub async fn run(&self) -> Result<(), OutboundRouterError> {
         let mut subscription = self
             .event_bus
-            .subscribe("ui.**")
+            .subscribe("{ui,system}.**")
             .map_err(|e| OutboundRouterError::SubscriptionFailed(e.to_string()))?;
 
         loop {
@@ -94,6 +103,25 @@ impl OutboundRouter {
 
     #[cfg(feature = "native")]
     async fn handle_event(&self, event: &Event) -> Result<(), OutboundRouterError> {
+        match &event.payload {
+            EventPayload::ConnectionEstablished { .. } | EventPayload::ComingOnline => {
+                self.is_online.store(true, Ordering::Relaxed);
+                return Ok(());
+            }
+            EventPayload::ConnectionLost { .. }
+            | EventPayload::ConnectionReconnecting { .. }
+            | EventPayload::GoingOffline => {
+                self.is_online.store(false, Ordering::Relaxed);
+                return Ok(());
+            }
+            _ => {}
+        }
+
+        let can_send_while_offline = matches!(event.source, EventSource::System(ref source) if source == OFFLINE_DRAIN_SOURCE);
+        if !self.is_online.load(Ordering::Relaxed) && !can_send_while_offline {
+            return Ok(());
+        }
+
         let mut message_sent = None;
         let mut own_presence_changed = None;
 
@@ -842,6 +870,31 @@ mod integration_tests {
         event_bus.publish(event).expect("publish should succeed");
     }
 
+    async fn publish_connection_established(event_bus: &Arc<dyn EventBus>) {
+        let event = Event::new(
+            Channel::new("system.connection.established").expect("valid channel"),
+            EventSource::Xmpp,
+            EventPayload::ConnectionEstablished {
+                jid: "alice@example.com".to_string(),
+            },
+        );
+        event_bus
+            .publish(event)
+            .expect("publish connection established should succeed");
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    fn connection_established_event() -> Event {
+        Event::new(
+            Channel::new("system.connection.established").expect("valid channel"),
+            EventSource::Xmpp,
+            EventPayload::ConnectionEstablished {
+                jid: "alice@example.com".to_string(),
+            },
+        )
+    }
+
     async fn yield_to_router() {
         tokio::task::yield_now().await;
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -853,6 +906,7 @@ mod integration_tests {
 
         let _handle = tokio::spawn(async move { router.run().await });
         yield_to_router().await;
+        publish_connection_established(&event_bus).await;
 
         publish_ui_event(
             &event_bus,
@@ -885,6 +939,7 @@ mod integration_tests {
 
         let _handle = tokio::spawn(async move { router.run().await });
         yield_to_router().await;
+        publish_connection_established(&event_bus).await;
 
         publish_ui_event(
             &event_bus,
@@ -912,6 +967,7 @@ mod integration_tests {
 
         let _handle = tokio::spawn(async move { router.run().await });
         yield_to_router().await;
+        publish_connection_established(&event_bus).await;
 
         publish_ui_event(
             &event_bus,
@@ -940,6 +996,7 @@ mod integration_tests {
 
         let _handle = tokio::spawn(async move { router.run().await });
         yield_to_router().await;
+        publish_connection_established(&event_bus).await;
 
         publish_ui_event(
             &event_bus,
@@ -967,6 +1024,7 @@ mod integration_tests {
 
         let _handle = tokio::spawn(async move { router.run().await });
         yield_to_router().await;
+        publish_connection_established(&event_bus).await;
 
         publish_ui_event(
             &event_bus,
@@ -998,6 +1056,7 @@ mod integration_tests {
 
         let _handle = tokio::spawn(async move { router.run().await });
         yield_to_router().await;
+        publish_connection_established(&event_bus).await;
 
         publish_ui_event(
             &event_bus,
@@ -1033,6 +1092,7 @@ mod integration_tests {
 
         let _handle = tokio::spawn(async move { router.run().await });
         yield_to_router().await;
+        publish_connection_established(&event_bus).await;
 
         let correlation_id = Uuid::new_v4();
         let event = Event::with_correlation(
@@ -1080,6 +1140,7 @@ mod integration_tests {
 
         let _handle = tokio::spawn(async move { router.run().await });
         yield_to_router().await;
+        publish_connection_established(&event_bus).await;
 
         publish_ui_event(
             &event_bus,
@@ -1099,6 +1160,63 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn ui_commands_are_ignored_while_offline() {
+        let (router, mut rx, event_bus) = make_router();
+
+        let _handle = tokio::spawn(async move { router.run().await });
+        yield_to_router().await;
+
+        publish_ui_event(
+            &event_bus,
+            "ui.message.send",
+            EventPayload::MessageSendRequested {
+                to: "bob@example.com".to_string(),
+                body: "offline".to_string(),
+                message_type: CoreMessageType::Chat,
+            },
+        );
+
+        let result = timeout(Duration::from_millis(100), rx.recv()).await;
+        assert!(
+            result.is_err(),
+            "offline UI command should not reach the wire"
+        );
+
+        _handle.abort();
+    }
+
+    #[tokio::test]
+    async fn offline_replay_source_bypasses_offline_gate() {
+        let (router, mut rx, event_bus) = make_router();
+
+        let _handle = tokio::spawn(async move { router.run().await });
+        yield_to_router().await;
+
+        event_bus
+            .publish(Event::with_correlation(
+                Channel::new("ui.message.send").expect("valid channel"),
+                EventSource::System("offline".to_string()),
+                EventPayload::MessageSendRequested {
+                    to: "bob@example.com".to_string(),
+                    body: "replay".to_string(),
+                    message_type: CoreMessageType::Chat,
+                },
+                Uuid::new_v4(),
+            ))
+            .expect("publish should succeed");
+
+        let bytes = timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("timed out waiting for replayed wire bytes")
+            .expect("channel should not be closed");
+
+        let stanza = Stanza::parse(&bytes).expect("wire bytes should parse as stanza");
+        assert_eq!(stanza.name(), "message");
+
+        _handle.abort();
+    }
+
+    #[tokio::test]
     async fn closed_wire_channel_returns_error() {
         let event_bus: Arc<dyn EventBus> = Arc::new(BroadcastEventBus::new(64));
         let pipeline = Arc::new(StanzaPipeline::new());
@@ -1106,6 +1224,10 @@ mod integration_tests {
         drop(rx);
 
         let router = OutboundRouter::new(event_bus.clone(), pipeline, tx);
+        router
+            .handle_event(&connection_established_event())
+            .await
+            .expect("connection established event should succeed");
 
         let event = Event::new(
             Channel::new("ui.message.send").unwrap(),
@@ -1136,6 +1258,10 @@ mod integration_tests {
         drop(rx);
 
         let router = OutboundRouter::new(event_bus.clone(), pipeline, tx);
+        router
+            .handle_event(&connection_established_event())
+            .await
+            .expect("connection established event should succeed");
 
         let event = Event::new(
             Channel::new("ui.message.send").expect("valid channel"),
@@ -1168,6 +1294,10 @@ mod integration_tests {
         drop(rx);
 
         let router = OutboundRouter::new(event_bus.clone(), pipeline, tx);
+        router
+            .handle_event(&connection_established_event())
+            .await
+            .expect("connection established event should succeed");
 
         let event = Event::new(
             Channel::new("ui.presence.set").expect("valid channel"),
@@ -1194,6 +1324,7 @@ mod integration_tests {
 
         let _handle = tokio::spawn(async move { router.run().await });
         yield_to_router().await;
+        publish_connection_established(&event_bus).await;
 
         let commands: Vec<(&str, EventPayload)> = vec![
             (
