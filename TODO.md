@@ -48,7 +48,7 @@
 - [x] Implement notifications manager: global toggle, focused-conversation suppression, per-conversation mute, notification aggregation rules. Emit via platform-native APIs (`notify-rust`).
 
 ## 6. Plugin System (`waddle-plugins`)
-- [ ] Scaffold `waddle-plugins` (depends: `core`, `storage` — not `xmpp`). Create modules for runtime, registry, and plugin KV storage.
+- [x] Scaffold `waddle-plugins` (depends: `core`, `storage` — not `xmpp`). Create modules for runtime, registry, and plugin KV storage.
 - [ ] Implement plugin manifest parsing/validation and capability-based permission policy checks from `specs/05-plugin-api/packaging.md` and `specs/05-plugin-api/permissions.md`.
 - [ ] Implement plugin KV storage with namespace isolation (`plugin_kv` table, keyed by plugin ID) and quota enforcement.
 - [ ] Implement Wasmtime runtime: fuel metering, epoch interruption, memory caps, dedicated blocking thread pool. Implement plugin lifecycle: load → init → unload, with 5-error auto-disable threshold.
