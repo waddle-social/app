@@ -1,0 +1,42 @@
+[package]
+name = "waddle-xmpp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "XMPP connection lifecycle, SASL, and stanza pipeline for Waddle"
+
+[features]
+default = ["native"]
+native = [
+    "waddle-core/native",
+    "dep:tokio",
+    "dep:tokio-xmpp",
+    "dep:tokio-rustls",
+    "dep:rustls",
+]
+web = [
+    "waddle-core/web",
+    "dep:tokio-tungstenite",
+    "dep:wasm-bindgen",
+    "dep:web-sys",
+]
+
+[dependencies]
+waddle-core = { workspace = true, default-features = false }
+tokio = { workspace = true, optional = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+xmpp-parsers = { workspace = true }
+tokio-xmpp = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-tungstenite = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+web-sys = { workspace = true, optional = true, features = ["BinaryType", "Blob", "CloseEvent", "ErrorEvent", "MessageEvent", "WebSocket"] }
+
+[dev-dependencies]
+tokio-test = { workspace = true }
+mockall = { workspace = true }
+tracing-test = { workspace = true }
