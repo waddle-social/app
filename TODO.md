@@ -17,7 +17,7 @@
 - [x] Implement theming module (built-in themes, custom theme loading, CSS variable token generation) per `specs/03-components/themes.md`.
 
 ## 3. Storage Infrastructure (`waddle-storage`)
-- [ ] Create `waddle-storage` with `native` and `web` feature flags and the `Database` trait API from `specs/03-components/core-storage.md`. Depends on `waddle-core` only.
+- [x] Create `waddle-storage` with `native` and `web` feature flags and the `Database` trait API from `specs/03-components/core-storage.md`. Depends on `waddle-core` only.
 - [ ] Implement native SQLite backend (`rusqlite`, WAL mode, serialised write path through a single writer task).
 - [ ] Implement migration runner and initial schema migration (`001_initial.sql`: `_migrations`, `messages`, `roster`, `muc_rooms`, `plugin_kv` tables with indices).
 - [ ] Add migration `002_add_mam_sync_state.sql` for the `mam_sync_state` table.
