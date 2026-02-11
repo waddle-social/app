@@ -80,7 +80,22 @@ async function createTauriTransport(): Promise<WaddleTransport> {
 }
 
 async function createWasmTransport(): Promise<WaddleTransport> {
-  const { WaddleCore } = await import('waddle-wasm');
+  const wasmModuleName = 'waddle-wasm';
+  const { WaddleCore } = (await import(/* @vite-ignore */ wasmModuleName)) as {
+    WaddleCore: {
+      init(): Promise<{
+        send_message(to: string, body: string): Promise<ChatMessage>;
+        get_roster(): Promise<RosterItem[]>;
+        set_presence(show: string, status?: string): Promise<void>;
+        join_room(roomJid: string, nick: string): Promise<void>;
+        leave_room(roomJid: string): Promise<void>;
+        get_history(jid: string, limit: number, before?: string): Promise<ChatMessage[]>;
+        manage_plugins(action: PluginAction): Promise<PluginInfo>;
+        get_config(): Promise<UiConfig>;
+        on<T>(channel: string, callback: (payload: T) => void): () => void;
+      }>;
+    };
+  };
   const core = await WaddleCore.init();
 
   return {

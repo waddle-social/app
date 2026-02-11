@@ -15,7 +15,9 @@ interface ThemeColors {
   muted: string;
 }
 
-const BUILTIN_THEMES: Record<string, ThemeColors> = {
+type BuiltinThemeName = 'light' | 'dark' | 'high-contrast';
+
+const BUILTIN_THEMES: Record<BuiltinThemeName, ThemeColors> = {
   light: {
     background: '#ffffff',
     foreground: '#1a1a1a',
@@ -50,6 +52,10 @@ const BUILTIN_THEMES: Record<string, ThemeColors> = {
     muted: '#aaaaaa',
   },
 };
+
+function isBuiltinThemeName(name: string): name is BuiltinThemeName {
+  return Object.prototype.hasOwnProperty.call(BUILTIN_THEMES, name);
+}
 
 function resolveSystemTheme(): 'light' | 'dark' {
   if (typeof window !== 'undefined' && window.matchMedia('(prefers-color-scheme: dark)').matches) {
@@ -105,7 +111,7 @@ export function useTheme(): void {
 
   waddle.listen<{ name: string }>('ui.theme.changed', (event) => {
     const name = event.payload.name;
-    if (name in BUILTIN_THEMES) {
+    if (isBuiltinThemeName(name)) {
       applyThemeColors(BUILTIN_THEMES[name]);
     }
   });
