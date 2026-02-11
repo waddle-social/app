@@ -6958,6 +6958,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "waddle-integration"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "waddle-core",
+ "waddle-mam",
+ "waddle-messaging",
+ "waddle-presence",
+ "waddle-roster",
+ "waddle-storage",
+]
+
+[[package]]
 name = "waddle-mam"
 version = "0.1.0"
 dependencies = [
