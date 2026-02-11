@@ -8,8 +8,122 @@ use ratatui::{
 
 use crate::state::{AppState, ConnectionStatus, InputMode, Panel};
 use waddle_core::event::PresenceShow;
+use waddle_core::theme::Theme;
+
+struct Palette {
+    background: Color,
+    foreground: Color,
+    surface: Color,
+    accent: Color,
+    border: Color,
+    success: Color,
+    warning: Color,
+    error: Color,
+    muted: Color,
+    roster_highlight: Color,
+    status_bar_bg: Color,
+    input_border: Color,
+    unread_badge: Color,
+}
+
+impl Palette {
+    fn from_theme(theme: &Theme) -> Self {
+        let background = parse_theme_color(&theme.colors.background, Color::Black);
+        let foreground = parse_theme_color(&theme.colors.foreground, Color::White);
+        let surface = parse_theme_color(&theme.colors.surface, background);
+        let accent = parse_theme_color(&theme.colors.accent, Color::Cyan);
+        let border = parse_theme_color(&theme.colors.border, Color::DarkGray);
+        let success = parse_theme_color(&theme.colors.success, Color::Green);
+        let warning = parse_theme_color(&theme.colors.warning, Color::Yellow);
+        let error = parse_theme_color(&theme.colors.error, Color::Red);
+        let muted = parse_theme_color(&theme.colors.muted, Color::DarkGray);
+
+        let roster_highlight = parse_theme_override(
+            theme
+                .tui_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.roster_highlight.as_deref()),
+            surface,
+        );
+        let status_bar_bg = parse_theme_override(
+            theme
+                .tui_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.status_bar_bg.as_deref()),
+            surface,
+        );
+        let input_border = parse_theme_override(
+            theme
+                .tui_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.input_border.as_deref()),
+            border,
+        );
+        let unread_badge = parse_theme_override(
+            theme
+                .tui_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.unread_badge.as_deref()),
+            warning,
+        );
+
+        Self {
+            background,
+            foreground,
+            surface,
+            accent,
+            border,
+            success,
+            warning,
+            error,
+            muted,
+            roster_highlight,
+            status_bar_bg,
+            input_border,
+            unread_badge,
+        }
+    }
+}
+
+fn parse_theme_override(value: Option<&str>, fallback: Color) -> Color {
+    value
+        .map(|color| parse_theme_color(color, fallback))
+        .unwrap_or(fallback)
+}
+
+fn parse_theme_color(value: &str, fallback: Color) -> Color {
+    let trimmed = value.trim();
+    let Some(hex) = trimmed.strip_prefix('#') else {
+        return fallback;
+    };
+
+    let normalized = match hex.len() {
+        3 => {
+            let mut output = String::with_capacity(6);
+            for c in hex.chars() {
+                output.push(c);
+                output.push(c);
+            }
+            output
+        }
+        6 => hex.to_string(),
+        8 => hex[..6].to_string(),
+        _ => return fallback,
+    };
+
+    let Ok(value) = u32::from_str_radix(&normalized, 16) else {
+        return fallback;
+    };
+
+    let r = ((value >> 16) & 0xff) as u8;
+    let g = ((value >> 8) & 0xff) as u8;
+    let b = (value & 0xff) as u8;
+    Color::Rgb(r, g, b)
+}
 
 pub fn draw(frame: &mut Frame, state: &AppState) {
+    let palette = Palette::from_theme(&state.theme);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -24,39 +138,41 @@ pub fn draw(frame: &mut Frame, state: &AppState) {
         .constraints([Constraint::Percentage(25), Constraint::Percentage(75)])
         .split(chunks[0]);
 
-    draw_sidebar(frame, state, main_chunks[0]);
-    draw_conversation(frame, state, main_chunks[1]);
-    draw_status_bar(frame, state, chunks[1]);
-    draw_input(frame, state, chunks[2]);
+    draw_sidebar(frame, state, main_chunks[0], &palette);
+    draw_conversation(frame, state, main_chunks[1], &palette);
+    draw_status_bar(frame, state, chunks[1], &palette);
+    draw_input(frame, state, chunks[2], &palette);
 }
 
-fn presence_indicator(show: &PresenceShow) -> (&str, Color) {
+fn presence_indicator(show: &PresenceShow, palette: &Palette) -> (&'static str, Color) {
     match show {
-        PresenceShow::Available | PresenceShow::Chat => ("●", Color::Green),
-        PresenceShow::Away => ("●", Color::Yellow),
-        PresenceShow::Xa => ("●", Color::Yellow),
-        PresenceShow::Dnd => ("●", Color::Red),
-        PresenceShow::Unavailable => ("○", Color::DarkGray),
+        PresenceShow::Available | PresenceShow::Chat => ("●", palette.success),
+        PresenceShow::Away => ("●", palette.warning),
+        PresenceShow::Xa => ("●", palette.warning),
+        PresenceShow::Dnd => ("●", palette.error),
+        PresenceShow::Unavailable => ("○", palette.muted),
     }
 }
 
-fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect, palette: &Palette) {
     let focused = state.focused_panel == Panel::Sidebar;
     let border_style = if focused {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(palette.accent)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(palette.border)
     };
 
+    let title = format!(" {} ", state.i18n.t("roster-title", None));
     let block = Block::default()
-        .title(" Roster ")
+        .title(title)
         .borders(Borders::ALL)
+        .style(Style::default().bg(palette.surface).fg(palette.foreground))
         .border_style(border_style);
 
     let mut items: Vec<ListItem> = Vec::new();
 
     for (i, entry) in state.roster.iter().enumerate() {
-        let (indicator, color) = presence_indicator(&entry.presence);
+        let (indicator, color) = presence_indicator(&entry.presence, palette);
         let name = entry.item.name.as_deref().unwrap_or(&entry.item.jid);
 
         let mut spans = vec![
@@ -79,22 +195,22 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
             spans.push(Span::styled(
                 format!(" ({})", entry.unread),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(palette.unread_badge)
                     .add_modifier(Modifier::BOLD),
             ));
         }
 
         let mut item = ListItem::new(Line::from(spans));
         if is_selected {
-            item = item.style(Style::default().bg(Color::DarkGray));
+            item = item.style(Style::default().bg(palette.roster_highlight));
         }
         items.push(item);
     }
 
     if !state.rooms.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
-            "── Rooms ──",
-            Style::default().fg(Color::DarkGray),
+            format!("── {} ──", state.i18n.t("rooms-title", None)),
+            Style::default().fg(palette.muted),
         ))));
 
         let roster_len = state.roster.len();
@@ -116,39 +232,53 @@ fn draw_sidebar(frame: &mut Frame, state: &AppState, area: Rect) {
                 spans.push(Span::styled(
                     format!(" ({})", room.unread),
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(palette.unread_badge)
                         .add_modifier(Modifier::BOLD),
                 ));
             }
 
             let mut item = ListItem::new(Line::from(spans));
             if is_selected {
-                item = item.style(Style::default().bg(Color::DarkGray));
+                item = item.style(Style::default().bg(palette.roster_highlight));
             }
             items.push(item);
         }
     }
 
-    let list = List::new(items).block(block);
+    if items.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            state.i18n.t("roster-empty", None),
+            Style::default().fg(palette.muted),
+        ))));
+    }
+
+    let list = List::new(items)
+        .block(block)
+        .style(Style::default().bg(palette.surface).fg(palette.foreground));
     frame.render_widget(list, area);
 }
 
-fn draw_conversation(frame: &mut Frame, state: &AppState, area: Rect) {
+fn draw_conversation(frame: &mut Frame, state: &AppState, area: Rect, palette: &Palette) {
     let focused = state.focused_panel == Panel::Conversation;
     let border_style = if focused {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(palette.accent)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(palette.border)
     };
 
     let title = match &state.active_conversation {
         Some(jid) => format!(" {} ", jid),
-        None => " No conversation selected ".to_string(),
+        None => format!(" {} ", state.i18n.t("conversation-none-title", None)),
     };
 
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
+        .style(
+            Style::default()
+                .bg(palette.background)
+                .fg(palette.foreground),
+        )
         .border_style(border_style);
 
     let conv = state.active_conversation_data();
@@ -166,11 +296,11 @@ fn draw_conversation(frame: &mut Frame, state: &AppState, area: Rect) {
                 let sender = if sender.is_empty() { "you" } else { sender };
 
                 let mut spans = vec![
-                    Span::styled(format!("{time} "), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("{time} "), Style::default().fg(palette.muted)),
                     Span::styled(
                         format!("{sender}: "),
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(palette.accent)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(&msg.body),
@@ -178,8 +308,8 @@ fn draw_conversation(frame: &mut Frame, state: &AppState, area: Rect) {
 
                 if state.delivered_message_ids.contains(&msg.id) {
                     spans.push(Span::styled(
-                        " [delivered]",
-                        Style::default().fg(Color::DarkGray),
+                        format!(" [{}]", state.i18n.t("message-delivered", None)),
+                        Style::default().fg(palette.muted),
                     ));
                 }
 
@@ -198,9 +328,9 @@ fn draw_conversation(frame: &mut Frame, state: &AppState, area: Rect) {
             if let Some(chat_state) = &conversation.remote_chat_state {
                 if matches!(chat_state, waddle_core::event::ChatState::Composing) {
                     typing_lines.push(Line::from(Span::styled(
-                        "typing...",
+                        state.i18n.t("chatstate-typing", None),
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(palette.muted)
                             .add_modifier(Modifier::ITALIC),
                     )));
                 }
@@ -208,44 +338,74 @@ fn draw_conversation(frame: &mut Frame, state: &AppState, area: Rect) {
 
             let paragraph = Paragraph::new(typing_lines)
                 .block(block)
+                .style(
+                    Style::default()
+                        .bg(palette.background)
+                        .fg(palette.foreground),
+                )
                 .wrap(Wrap { trim: false });
             frame.render_widget(paragraph, area);
         }
-        _ => {
-            let help = Paragraph::new("Press Enter on a contact to start chatting")
-                .style(Style::default().fg(Color::DarkGray))
-                .block(block);
-            frame.render_widget(help, area);
+        Some(_) => {
+            let text = state.i18n.t("conversation-empty", None);
+            let paragraph = Paragraph::new(text)
+                .style(Style::default().fg(palette.muted).bg(palette.background))
+                .block(block)
+                .wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, area);
+        }
+        None => {
+            let text = state.i18n.t("conversation-select", None);
+            let paragraph = Paragraph::new(text)
+                .style(Style::default().fg(palette.muted).bg(palette.background))
+                .block(block)
+                .wrap(Wrap { trim: false });
+            frame.render_widget(paragraph, area);
         }
     }
 }
 
-fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect) {
-    let status_text = match &state.connection_status {
-        ConnectionStatus::Connected { jid } => {
-            format!(" Connected as {jid} │ Online │ UTF-8 ")
+fn draw_status_bar(frame: &mut Frame, state: &AppState, area: Rect, palette: &Palette) {
+    let mut status_text = match &state.connection_status {
+        ConnectionStatus::Connected { jid } => format!(
+            " {} {jid} │ {} │ UTF-8 ",
+            state.i18n.t("status-connected-as", None),
+            state.i18n.t("status-available", None),
+        ),
+        ConnectionStatus::Syncing => format!(" {} │ UTF-8 ", state.i18n.t("status-syncing", None)),
+        ConnectionStatus::Connecting => format!(" {} ", state.i18n.t("status-connecting", None)),
+        ConnectionStatus::Disconnected => {
+            format!(" {} ", state.i18n.t("status-disconnected", None))
         }
-        ConnectionStatus::Syncing => " Syncing... │ Online │ UTF-8 ".to_string(),
-        other => format!(" {} ", other.label()),
     };
+
+    if let Some(feedback) = &state.command_feedback {
+        status_text.push_str("│ ");
+        status_text.push_str(feedback);
+        status_text.push(' ');
+    }
 
     let status_color = match &state.connection_status {
-        ConnectionStatus::Connected { .. } => Color::Green,
-        ConnectionStatus::Syncing => Color::Yellow,
-        ConnectionStatus::Connecting => Color::Yellow,
-        ConnectionStatus::Disconnected => Color::Red,
+        ConnectionStatus::Connected { .. } => palette.success,
+        ConnectionStatus::Syncing => palette.warning,
+        ConnectionStatus::Connecting => palette.warning,
+        ConnectionStatus::Disconnected => palette.error,
     };
 
-    let status =
-        Paragraph::new(status_text).style(Style::default().bg(Color::DarkGray).fg(status_color));
+    let status = Paragraph::new(status_text).style(
+        Style::default()
+            .bg(palette.status_bar_bg)
+            .fg(status_color)
+            .add_modifier(Modifier::BOLD),
+    );
     frame.render_widget(status, area);
 }
 
-fn draw_input(frame: &mut Frame, state: &AppState, area: Rect) {
-    let (title, style) = match state.input_mode {
-        InputMode::Normal => (" Normal ", Style::default().fg(Color::DarkGray)),
-        InputMode::Insert => (" Insert ", Style::default().fg(Color::Green)),
-        InputMode::Command => (" Command ", Style::default().fg(Color::Yellow)),
+fn draw_input(frame: &mut Frame, state: &AppState, area: Rect, palette: &Palette) {
+    let (title, color) = match state.input_mode {
+        InputMode::Normal => (state.i18n.t("mode-normal", None), palette.input_border),
+        InputMode::Insert => (state.i18n.t("mode-insert", None), palette.success),
+        InputMode::Command => (state.i18n.t("mode-command", None), palette.warning),
     };
 
     let prefix = match state.input_mode {
@@ -254,11 +414,14 @@ fn draw_input(frame: &mut Frame, state: &AppState, area: Rect) {
     };
 
     let block = Block::default()
-        .title(title)
+        .title(format!(" {title} "))
         .borders(Borders::ALL)
-        .border_style(style);
+        .style(Style::default().bg(palette.surface).fg(palette.foreground))
+        .border_style(Style::default().fg(color));
 
-    let input = Paragraph::new(format!("{prefix}{}", state.input_buffer)).block(block);
+    let input = Paragraph::new(format!("{prefix}{}", state.input_buffer))
+        .style(Style::default().fg(palette.foreground).bg(palette.surface))
+        .block(block);
     frame.render_widget(input, area);
 
     if state.input_mode != InputMode::Normal {

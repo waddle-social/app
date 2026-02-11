@@ -1,4 +1,5 @@
 use waddle_core::error::EventBusError;
+use waddle_core::theme::ThemeError;
 
 #[derive(Debug, thiserror::Error)]
 #[allow(dead_code)]
@@ -11,4 +12,7 @@ pub enum TuiError {
 
     #[error("event bus error: {0}")]
     EventBus(#[from] EventBusError),
+
+    #[error("theme error: {0}")]
+    Theme(#[from] ThemeError),
 }

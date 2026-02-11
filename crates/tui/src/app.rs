@@ -9,6 +9,8 @@ use waddle_core::config::Config;
 use waddle_core::event::{
     Channel, ChatMessage, Event, EventBus, EventPayload, EventSource, PresenceShow, UiTarget,
 };
+use waddle_core::i18n::I18n;
+use waddle_core::theme::ThemeManager;
 
 use crate::error::TuiError;
 use crate::input::{self, Action};
@@ -18,23 +20,34 @@ use crate::ui;
 pub struct TuiApp;
 
 impl TuiApp {
-    pub async fn run(event_bus: Arc<dyn EventBus>, _config: &Config) -> Result<(), TuiError> {
+    pub async fn run(event_bus: Arc<dyn EventBus>, config: &Config) -> Result<(), TuiError> {
         let mut terminal =
             ratatui::try_init().map_err(|e| TuiError::TerminalInit(e.to_string()))?;
-        let result = run_loop(&mut terminal, event_bus).await;
+        let state = initial_state(config)?;
+        let result = run_loop(&mut terminal, event_bus, state).await;
         ratatui::restore();
         result
     }
 }
 
+fn initial_state(config: &Config) -> Result<AppState, TuiError> {
+    let i18n = I18n::new(config.ui.locale.as_deref(), &["en-US"]);
+    let theme = ThemeManager::load(&config.theme).map_err(TuiError::Theme)?;
+
+    let mut theme_manager = ThemeManager::new();
+    if ThemeManager::builtin(&theme.name).is_none() {
+        theme_manager.register_custom(theme.clone());
+    }
+
+    Ok(AppState::new(i18n, theme_manager, theme))
+}
+
 async fn run_loop(
     terminal: &mut DefaultTerminal,
     event_bus: Arc<dyn EventBus>,
+    mut state: AppState,
 ) -> Result<(), TuiError> {
-    let mut state = AppState::new();
-
     let mut event_sub = event_bus.subscribe("**").map_err(TuiError::EventBus)?;
-
     let mut reader = EventStream::new();
 
     loop {
@@ -122,74 +135,204 @@ fn handle_command(
     state: &mut AppState,
     cmd: &str,
 ) -> Result<(), TuiError> {
-    let parts: Vec<&str> = cmd.splitn(2, ' ').collect();
-    match parts[0] {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+
+    let (raw_head, tail) = split_head_tail(trimmed);
+    let head = raw_head.to_ascii_lowercase();
+
+    if let Some(show) = parse_presence_show(&head) {
+        publish(
+            event_bus,
+            "ui.presence.set",
+            EventPayload::PresenceSetRequested {
+                show: show.clone(),
+                status: non_empty_string(tail),
+            },
+        )?;
+
+        let label = state.i18n.t(presence_message_id(&show), None);
+        let prefix = state.i18n.t("command-presence-updated", None);
+        state.command_feedback = Some(format!("{prefix} {label}"));
+        return Ok(());
+    }
+
+    match head.as_str() {
         "quit" | "q" => {
             state.should_quit = true;
         }
-        "available" | "away" | "dnd" | "xa" | "chat" => {
-            let show = match parts[0] {
-                "available" => PresenceShow::Available,
-                "away" => PresenceShow::Away,
-                "dnd" => PresenceShow::Dnd,
-                "xa" => PresenceShow::Xa,
-                "chat" => PresenceShow::Chat,
-                _ => unreachable!(),
+        "help" | "h" => {
+            state.command_feedback = Some(command_help_text(state));
+        }
+        "status" | "presence" => {
+            let (show_token, status_tail) = split_head_tail(tail);
+            if show_token.is_empty() {
+                state.command_feedback = Some(state.i18n.t("command-presence-usage", None));
+                return Ok(());
+            }
+
+            let Some(show) = parse_presence_show(&show_token.to_ascii_lowercase()) else {
+                state.command_feedback = Some(state.i18n.t("command-presence-usage", None));
+                return Ok(());
             };
-            let status = parts.get(1).map(|s| s.to_string());
+
             publish(
                 event_bus,
                 "ui.presence.set",
-                EventPayload::PresenceSetRequested { show, status },
+                EventPayload::PresenceSetRequested {
+                    show: show.clone(),
+                    status: non_empty_string(status_tail),
+                },
             )?;
+
+            let label = state.i18n.t(presence_message_id(&show), None);
+            let prefix = state.i18n.t("command-presence-updated", None);
+            state.command_feedback = Some(format!("{prefix} {label}"));
         }
         "join" => {
-            if let Some(room_arg) = parts.get(1) {
-                let room_parts: Vec<&str> = room_arg.splitn(2, ' ').collect();
-                let room = room_parts[0].to_string();
-                let nick = room_parts.get(1).unwrap_or(&"waddle-user").to_string();
-                publish(
-                    event_bus,
-                    "ui.muc.join",
-                    EventPayload::MucJoinRequested { room, nick },
-                )?;
+            let (room, nick_tail) = split_head_tail(tail);
+            if room.is_empty() {
+                state.command_feedback = Some(state.i18n.t("command-join-usage", None));
+                return Ok(());
             }
+
+            let nick = if nick_tail.is_empty() {
+                default_nick(state).to_string()
+            } else {
+                nick_tail.to_string()
+            };
+
+            publish(
+                event_bus,
+                "ui.muc.join",
+                EventPayload::MucJoinRequested {
+                    room: room.to_string(),
+                    nick,
+                },
+            )?;
+
+            let prefix = state.i18n.t("command-joining-room", None);
+            state.command_feedback = Some(format!("{prefix} {room}"));
         }
         "leave" => {
-            if let Some(room) = parts.get(1) {
-                publish(
-                    event_bus,
-                    "ui.muc.leave",
-                    EventPayload::MucLeaveRequested {
-                        room: room.to_string(),
-                    },
-                )?;
-            } else if let Some(active) = &state.active_conversation {
-                if state.rooms.iter().any(|r| r.jid == *active) {
-                    publish(
-                        event_bus,
-                        "ui.muc.leave",
-                        EventPayload::MucLeaveRequested {
-                            room: active.clone(),
-                        },
-                    )?;
-                }
-            }
+            let room = if !tail.is_empty() {
+                Some(tail.to_string())
+            } else {
+                state
+                    .active_conversation
+                    .as_ref()
+                    .filter(|active| state.rooms.iter().any(|r| r.jid == **active))
+                    .cloned()
+            };
+
+            let Some(room) = room else {
+                state.command_feedback = Some(state.i18n.t("command-leave-usage", None));
+                return Ok(());
+            };
+
+            publish(
+                event_bus,
+                "ui.muc.leave",
+                EventPayload::MucLeaveRequested { room: room.clone() },
+            )?;
+
+            let prefix = state.i18n.t("command-leaving-room", None);
+            state.command_feedback = Some(format!("{prefix} {room}"));
         }
         "theme" => {
-            if let Some(theme_id) = parts.get(1) {
-                publish(
-                    event_bus,
-                    "ui.theme.changed",
-                    EventPayload::ThemeChanged {
-                        theme_id: theme_id.to_string(),
-                    },
-                )?;
+            let theme_id = tail.trim();
+            if theme_id.is_empty() {
+                state.command_feedback = Some(state.i18n.t("command-theme-usage", None));
+                return Ok(());
             }
+
+            let Some(theme) = state.theme_manager.get(theme_id) else {
+                let prefix = state.i18n.t("command-theme-not-found", None);
+                state.command_feedback = Some(format!("{prefix} {theme_id}"));
+                return Ok(());
+            };
+
+            publish(
+                event_bus,
+                "ui.theme.changed",
+                EventPayload::ThemeChanged {
+                    theme_id: theme_id.to_string(),
+                },
+            )?;
+
+            state.theme = theme;
+            let prefix = state.i18n.t("command-theme-switched", None);
+            state.command_feedback = Some(format!("{prefix} {theme_id}"));
         }
-        _ => {}
+        _ => {
+            let prefix = state.i18n.t("command-unknown", None);
+            state.command_feedback = Some(format!("{prefix} {raw_head}"));
+        }
     }
+
     Ok(())
+}
+
+fn parse_presence_show(value: &str) -> Option<PresenceShow> {
+    match value {
+        "available" => Some(PresenceShow::Available),
+        "away" => Some(PresenceShow::Away),
+        "dnd" => Some(PresenceShow::Dnd),
+        "xa" => Some(PresenceShow::Xa),
+        "chat" => Some(PresenceShow::Chat),
+        _ => None,
+    }
+}
+
+fn presence_message_id(show: &PresenceShow) -> &'static str {
+    match show {
+        PresenceShow::Available | PresenceShow::Chat => "status-available",
+        PresenceShow::Away => "status-away",
+        PresenceShow::Xa => "status-xa",
+        PresenceShow::Dnd => "status-dnd",
+        PresenceShow::Unavailable => "status-unavailable",
+    }
+}
+
+fn split_head_tail(input: &str) -> (&str, &str) {
+    let trimmed = input.trim();
+    if let Some(index) = trimmed.find(char::is_whitespace) {
+        (&trimmed[..index], trimmed[index..].trim())
+    } else {
+        (trimmed, "")
+    }
+}
+
+fn non_empty_string(input: &str) -> Option<String> {
+    if input.is_empty() {
+        None
+    } else {
+        Some(input.to_string())
+    }
+}
+
+fn default_nick(state: &AppState) -> &str {
+    state
+        .connected_jid
+        .as_deref()
+        .and_then(|jid| jid.split('@').next())
+        .filter(|nick| !nick.is_empty())
+        .unwrap_or("waddle-user")
+}
+
+fn command_help_text(state: &AppState) -> String {
+    let status_usage = state.i18n.t("command-presence-usage", None);
+
+    format!(
+        ":help ({}) | :quit ({}) | :status ({status_usage}) | :join ({}) | :leave ({}) | :theme ({})",
+        state.i18n.t("cmd-help", None),
+        state.i18n.t("cmd-quit", None),
+        state.i18n.t("cmd-join", None),
+        state.i18n.t("cmd-leave", None),
+        state.i18n.t("cmd-theme", None),
+    )
 }
 
 fn handle_bus_event(state: &mut AppState, event: Event) {
@@ -306,6 +449,11 @@ fn handle_bus_event(state: &mut AppState, event: Event) {
                 };
             }
         }
+        EventPayload::ThemeChanged { theme_id } => {
+            if let Some(theme) = state.theme_manager.get(&theme_id) {
+                state.theme = theme;
+            }
+        }
         _ => {}
     }
 }
@@ -338,4 +486,124 @@ fn publish(
     let event = Event::new(channel, EventSource::Ui(UiTarget::Tui), payload);
     event_bus.publish(event).map_err(TuiError::EventBus)?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "native"))]
+mod tests {
+    use super::*;
+
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+    use waddle_core::config::ThemeConfig;
+    use waddle_core::event::{BroadcastEventBus, EventBus};
+
+    fn test_state() -> AppState {
+        let i18n = I18n::new(Some("en-US"), &["en-US"]);
+        let theme = ThemeManager::load(&ThemeConfig::default()).unwrap();
+        let mut theme_manager = ThemeManager::new();
+        if ThemeManager::builtin(&theme.name).is_none() {
+            theme_manager.register_custom(theme.clone());
+        }
+
+        AppState::new(i18n, theme_manager, theme)
+    }
+
+    fn test_event_bus() -> Arc<dyn EventBus> {
+        Arc::new(BroadcastEventBus::default())
+    }
+
+    #[tokio::test]
+    async fn command_status_publishes_presence_set() {
+        let event_bus = test_event_bus();
+        let mut sub = event_bus.subscribe("ui.presence.set").unwrap();
+        let mut state = test_state();
+
+        handle_command(&event_bus, &mut state, "status away in a meeting").unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            event.payload,
+            EventPayload::PresenceSetRequested {
+                show: PresenceShow::Away,
+                status: Some(status),
+            } if status == "in a meeting"
+        ));
+    }
+
+    #[tokio::test]
+    async fn command_theme_publishes_theme_changed_and_updates_state() {
+        let event_bus = test_event_bus();
+        let mut sub = event_bus.subscribe("ui.theme.changed").unwrap();
+        let mut state = test_state();
+
+        handle_command(&event_bus, &mut state, "theme dark").unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            event.payload,
+            EventPayload::ThemeChanged { theme_id } if theme_id == "dark"
+        ));
+        assert_eq!(state.theme.name, "dark");
+    }
+
+    #[tokio::test]
+    async fn command_join_publishes_muc_join_request() {
+        let event_bus = test_event_bus();
+        let mut sub = event_bus.subscribe("ui.muc.join").unwrap();
+        let mut state = test_state();
+
+        handle_command(
+            &event_bus,
+            &mut state,
+            "join general@conference.example.com Alice",
+        )
+        .unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            event.payload,
+            EventPayload::MucJoinRequested { room, nick }
+                if room == "general@conference.example.com" && nick == "Alice"
+        ));
+    }
+
+    #[tokio::test]
+    async fn command_leave_uses_active_room_when_no_arg() {
+        let event_bus = test_event_bus();
+        let mut sub = event_bus.subscribe("ui.muc.leave").unwrap();
+        let mut state = test_state();
+
+        let room = "general@conference.example.com".to_string();
+        state.rooms.push(MucRoom {
+            jid: room.clone(),
+            name: "general".to_string(),
+            unread: 0,
+        });
+        state.active_conversation = Some(room.clone());
+
+        handle_command(&event_bus, &mut state, "leave").unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(matches!(
+            event.payload,
+            EventPayload::MucLeaveRequested { room: payload_room } if payload_room == room
+        ));
+    }
 }

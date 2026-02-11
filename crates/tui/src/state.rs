@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
 use waddle_core::event::{ChatMessage, ChatState, PresenceShow, RosterItem};
+use waddle_core::i18n::I18n;
+use waddle_core::theme::{Theme, ThemeManager};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStatus {
@@ -11,15 +13,6 @@ pub enum ConnectionStatus {
 }
 
 impl ConnectionStatus {
-    pub fn label(&self) -> &str {
-        match self {
-            Self::Disconnected => "Disconnected",
-            Self::Connecting => "Connecting...",
-            Self::Connected { .. } => "Connected",
-            Self::Syncing => "Syncing...",
-        }
-    }
-
     #[allow(dead_code)]
     pub fn jid(&self) -> Option<&str> {
         match self {
@@ -75,11 +68,15 @@ pub struct AppState {
     pub focused_panel: Panel,
     pub sidebar_index: usize,
     pub scroll_offset: u16,
+    pub i18n: I18n,
+    pub theme_manager: ThemeManager,
+    pub theme: Theme,
+    pub command_feedback: Option<String>,
     pub should_quit: bool,
 }
 
 impl AppState {
-    pub fn new() -> Self {
+    pub fn new(i18n: I18n, theme_manager: ThemeManager, theme: Theme) -> Self {
         Self {
             roster: Vec::new(),
             rooms: Vec::new(),
@@ -93,6 +90,10 @@ impl AppState {
             focused_panel: Panel::Sidebar,
             sidebar_index: 0,
             scroll_offset: 0,
+            i18n,
+            theme_manager,
+            theme,
+            command_feedback: None,
             should_quit: false,
         }
     }
