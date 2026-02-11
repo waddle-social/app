@@ -12,15 +12,12 @@ pub struct Channel(String);
 
 impl Channel {
     /// Create a new channel, validating its format.
-    pub fn new(name: impl Into<String>) -> crate::Result<Self> {
+    pub fn new(name: impl Into<String>) -> std::result::Result<Self, crate::error::EventBusError> {
         let name = name.into();
         if Self::is_valid(&name) {
             Ok(Self(name))
         } else {
-            Err(crate::WaddleError::Internal(format!(
-                "Invalid channel name: {}",
-                name
-            )))
+            Err(crate::error::EventBusError::InvalidChannel(name))
         }
     }
 
