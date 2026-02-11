@@ -7,11 +7,14 @@ use waddle_core::event::ChatMessage;
 use waddle_storage::{Database, FromRow, Row, SqlValue, StorageError};
 
 #[cfg(feature = "native")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "native")]
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "native")]
 use waddle_core::event::{
-    Channel, Event, EventBus, EventPayload, EventSource, EventSubscription, ScrollDirection,
+    Channel, Event, EventBus, EventPayload, EventSource, EventSubscription, PresenceShow,
+    ScrollDirection,
 };
 
 const MAM_PAGE_SIZE: u32 = 50;
@@ -82,13 +85,19 @@ fn sync_key(jid: &str) -> String {
 pub struct MamManager<D: Database> {
     db: Arc<D>,
     #[cfg(feature = "native")]
+    startup_sync_pending: AtomicBool,
+    #[cfg(feature = "native")]
     event_bus: Arc<dyn EventBus>,
 }
 
 impl<D: Database> MamManager<D> {
     #[cfg(feature = "native")]
     pub fn new(db: Arc<D>, event_bus: Arc<dyn EventBus>) -> Self {
-        Self { db, event_bus }
+        Self {
+            db,
+            startup_sync_pending: AtomicBool::new(false),
+            event_bus,
+        }
     }
 
     pub async fn sync_since(&self, _timestamp: DateTime<Utc>) -> Result<MamSyncResult, MamError> {
@@ -384,7 +393,22 @@ impl<D: Database> MamManager<D> {
     pub async fn handle_event(&self, event: &Event) {
         match &event.payload {
             EventPayload::ConnectionEstablished { jid } => {
-                info!(jid = %jid, "connection established, starting MAM catch-up sync");
+                self.startup_sync_pending.store(true, Ordering::Relaxed);
+                info!(jid = %jid, "connection established, waiting for own presence before MAM catch-up sync");
+            }
+            EventPayload::ConnectionLost { .. } => {
+                self.startup_sync_pending.store(false, Ordering::Relaxed);
+            }
+            EventPayload::OwnPresenceChanged { show, .. } => {
+                if matches!(show, PresenceShow::Unavailable) {
+                    return;
+                }
+
+                if !self.startup_sync_pending.swap(false, Ordering::Relaxed) {
+                    return;
+                }
+
+                info!("initial own presence published, starting MAM catch-up sync");
                 match self.sync_since(Utc::now()).await {
                     Ok(result) => {
                         info!(
@@ -433,7 +457,7 @@ impl<D: Database> MamManager<D> {
     pub async fn run(self: Arc<Self>) -> Result<(), MamError> {
         let mut sub = self
             .event_bus
-            .subscribe("{system,ui}.**")
+            .subscribe("{system,ui,xmpp}.**")
             .map_err(|e| MamError::EventBus(e.to_string()))?;
 
         loop {
@@ -462,7 +486,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tempfile::TempDir;
-    use waddle_core::event::{BroadcastEventBus, EventBus, MessageType};
+    use waddle_core::event::{BroadcastEventBus, EventBus, MessageType, PresenceShow};
 
     async fn setup() -> (Arc<MamManager<impl Database>>, Arc<dyn EventBus>, TempDir) {
         let dir = TempDir::new().expect("failed to create temp dir");
@@ -680,7 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_connection_established_triggers_sync() {
+    async fn handle_connection_established_waits_for_own_presence_before_sync() {
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -688,22 +712,33 @@ mod tests {
 
                 let mut ui_sub = event_bus.subscribe("ui.**").unwrap();
 
+                let connected = Event::new(
+                    Channel::new("system.connection.established").unwrap(),
+                    EventSource::Xmpp,
+                    EventPayload::ConnectionEstablished {
+                        jid: "alice@example.com".to_string(),
+                    },
+                );
+                manager.handle_event(&connected).await;
+
+                let no_query_yet =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), ui_sub.recv())
+                        .await;
+                assert!(no_query_yet.is_err(), "sync should wait for own presence");
+
                 let manager_clone = manager.clone();
                 let handle = tokio::task::spawn_local(async move {
-                    let event = Event::new(
-                        Channel::new("system.connection.established").unwrap(),
+                    let own_presence = Event::new(
+                        Channel::new("xmpp.presence.own_changed").unwrap(),
                         EventSource::Xmpp,
-                        EventPayload::ConnectionEstablished {
-                            jid: "alice@example.com".to_string(),
+                        EventPayload::OwnPresenceChanged {
+                            show: PresenceShow::Available,
+                            status: None,
                         },
                     );
-                    manager_clone.handle_event(&event).await;
+                    manager_clone.handle_event(&own_presence).await;
                 });
 
-                tokio::task::yield_now().await;
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-                // The handle_event should trigger sync_since which sends a MAM query
                 let query_event =
                     tokio::time::timeout(std::time::Duration::from_millis(500), ui_sub.recv())
                         .await

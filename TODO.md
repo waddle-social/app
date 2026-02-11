@@ -63,7 +63,7 @@
 - [x] Implement the `useWaddle()` composable abstracting Tauri IPC (`invoke()`) vs direct WASM imports (`wasm-bindgen`). Implement plugin SFC dynamic loading and CSS custom property theme switching.
 
 ## 8. Integration, Testing, and Delivery
-- [ ] Implement startup/shutdown orchestration matching the deterministic sequences in `specs/04-events/lifecycle.md` (config → storage → event bus → plugins → XMPP connection → roster → presence → MAM sync).
+- [x] Implement startup/shutdown orchestration matching the deterministic sequences in `specs/04-events/lifecycle.md` (config → storage → event bus → plugins → XMPP connection → roster → presence → MAM sync).
 - [ ] Create `waddle-test-support` crate with fixture loading helpers and test stanza/roster/config data in `tests/fixtures/`.
 - [ ] Add Prosody testcontainers harness with pre-configured test users (alice, bob, charlie) and modules (MAM, MUC, Carbons) per `specs/07-testing/infrastructure.md`.
 - [ ] Add integration tests for cross-crate flows: connection/auth, roster sync, 1:1 messaging, MUC messaging, MAM sync, offline queue drain.

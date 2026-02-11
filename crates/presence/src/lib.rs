@@ -8,6 +8,8 @@ use waddle_core::event::{Event, EventPayload, PresenceShow};
 
 #[cfg(feature = "native")]
 use std::sync::Arc;
+#[cfg(feature = "native")]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "native")]
 use waddle_core::event::{Channel, EventBus, EventSource};
@@ -53,6 +55,8 @@ pub struct PresenceManager {
     /// Bare JID -> (resource -> PresenceInfo)
     contacts: RwLock<HashMap<String, ResourceMap>>,
     #[cfg(feature = "native")]
+    awaiting_initial_presence: AtomicBool,
+    #[cfg(feature = "native")]
     event_bus: Arc<dyn EventBus>,
 }
 
@@ -68,6 +72,7 @@ impl PresenceManager {
                 last_updated: Utc::now(),
             }),
             contacts: RwLock::new(HashMap::new()),
+            awaiting_initial_presence: AtomicBool::new(false),
             event_bus,
         }
     }
@@ -120,20 +125,41 @@ impl PresenceManager {
     pub async fn handle_event(&self, event: &Event) {
         match &event.payload {
             EventPayload::ConnectionEstablished { jid } => {
-                debug!(jid = %jid, "connection established, sending initial presence");
+                debug!(jid = %jid, "connection established, waiting for roster before initial presence");
                 {
                     let mut own = self.own_presence.write().unwrap();
                     own.jid = jid.clone();
-                    own.show = PresenceShow::Available;
+                    own.show = PresenceShow::Unavailable;
                     own.status = None;
                     own.priority = 0;
                     own.last_updated = Utc::now();
                 }
                 self.contacts.write().unwrap().clear();
+                self.awaiting_initial_presence
+                    .store(true, Ordering::Relaxed);
+            }
+            EventPayload::RosterReceived { .. } => {
+                if !self
+                    .awaiting_initial_presence
+                    .swap(false, Ordering::Relaxed)
+                {
+                    return;
+                }
+
+                debug!("roster received, sending initial presence");
+                {
+                    let mut own = self.own_presence.write().unwrap();
+                    own.show = PresenceShow::Available;
+                    own.status = None;
+                    own.priority = 0;
+                    own.last_updated = Utc::now();
+                }
                 self.send_initial_presence();
             }
             EventPayload::ConnectionLost { .. } => {
                 debug!("connection lost, sending unavailable and clearing presence map");
+                self.awaiting_initial_presence
+                    .store(false, Ordering::Relaxed);
                 self.send_unavailable_presence();
                 self.contacts.write().unwrap().clear();
                 {
@@ -309,7 +335,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_established_sends_initial_presence() {
+    async fn connection_established_waits_for_roster_before_initial_presence() {
         let (manager, event_bus) = make_manager();
         let mut sub = event_bus.subscribe("ui.**").unwrap();
 
@@ -322,10 +348,23 @@ mod tests {
         manager.handle_event(&event).await;
 
         let own = manager.own_presence();
-        assert!(matches!(own.show, PresenceShow::Available));
+        assert!(matches!(own.show, PresenceShow::Unavailable));
         assert_eq!(own.jid, "user@example.com");
 
-        let received = tokio::time::timeout(Duration::from_millis(100), sub.recv())
+        let no_event = tokio::time::timeout(Duration::from_millis(100), sub.recv()).await;
+        assert!(no_event.is_err(), "initial presence should wait for roster");
+
+        let event = Event::new(
+            Channel::new("xmpp.roster.received").unwrap(),
+            EventSource::Xmpp,
+            EventPayload::RosterReceived { items: Vec::new() },
+        );
+        manager.handle_event(&event).await;
+
+        let own = manager.own_presence();
+        assert!(matches!(own.show, PresenceShow::Available));
+
+        let received = tokio::time::timeout(Duration::from_millis(200), sub.recv())
             .await
             .expect("timed out")
             .expect("should receive event");

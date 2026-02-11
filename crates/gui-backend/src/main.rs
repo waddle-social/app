@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
@@ -37,6 +38,7 @@ const SYSTEM_COMPONENT: &str = "gui-backend";
 const CONNECTION_TIMEOUT_SECONDS: u32 = 30;
 const CONNECTION_MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const WIRE_CHANNEL_CAPACITY: usize = 256;
+const SHUTDOWN_CLEANUP_TIMEOUT_SECONDS: u64 = 5;
 
 #[derive(Debug, thiserror::Error)]
 enum GuiBackendError {
@@ -323,6 +325,12 @@ async fn initialize_backend(app_handle: AppHandle) -> Result<AppState, GuiBacken
     let config = config::load_config()?;
     let ui_config = UiConfigResponse::from_config(&config);
 
+    let storage_path = resolve_storage_path(&config);
+    let database: Arc<NativeDatabase> =
+        Arc::new(waddle_storage::open_native_database(storage_path.as_path()).await?);
+
+    info!(path = %storage_path.display(), "storage initialized");
+
     let event_bus: Arc<dyn EventBus> =
         Arc::new(BroadcastEventBus::new(config.event_bus.channel_capacity));
 
@@ -333,18 +341,27 @@ async fn initialize_backend(app_handle: AppHandle) -> Result<AppState, GuiBacken
         EventPayload::ConfigReloaded,
     )?;
 
-    let storage_path = resolve_storage_path(&config);
-    let database: Arc<NativeDatabase> =
-        Arc::new(waddle_storage::open_native_database(storage_path.as_path()).await?);
-
-    info!(path = %storage_path.display(), "storage initialized");
-
     publish_event(
         &event_bus,
         "system.storage.ready",
         EventSource::System(SYSTEM_COMPONENT.to_string()),
         EventPayload::StartupComplete,
     )?;
+
+    let plugin_registry = Arc::new(PluginRegistry::new(
+        RegistryConfig::default(),
+        resolve_plugin_data_dir(&config),
+    )?);
+
+    let plugin_runtime = Arc::new(Mutex::new(PluginRuntime::new(
+        PluginRuntimeConfig::default(),
+        event_bus.clone(),
+        database.clone(),
+    )));
+
+    if config.plugins.enabled {
+        load_installed_plugins(&plugin_registry, &plugin_runtime, &event_bus).await;
+    }
 
     let roster_manager = Arc::new(RosterManager::new(database.clone(), event_bus.clone()));
     let message_manager = Arc::new(MessageManager::new(database.clone(), event_bus.clone()));
@@ -377,21 +394,6 @@ async fn initialize_backend(app_handle: AppHandle) -> Result<AppState, GuiBacken
         async move { manager.run().await.map_err(|error| error.to_string()) }
     });
 
-    let plugin_registry = Arc::new(PluginRegistry::new(
-        RegistryConfig::default(),
-        resolve_plugin_data_dir(&config),
-    )?);
-
-    let plugin_runtime = Arc::new(Mutex::new(PluginRuntime::new(
-        PluginRuntimeConfig::default(),
-        event_bus.clone(),
-        database.clone(),
-    )));
-
-    if config.plugins.enabled {
-        load_installed_plugins(&plugin_registry, &plugin_runtime, &event_bus).await;
-    }
-
     let pipeline = Arc::new(build_stanza_pipeline(event_bus.clone()));
     let (wire_sender, wire_receiver) = stanza_channel(WIRE_CHANNEL_CAPACITY);
     let outbound_router = Arc::new(OutboundRouter::new(
@@ -411,8 +413,7 @@ async fn initialize_backend(app_handle: AppHandle) -> Result<AppState, GuiBacken
     )));
 
     spawn_wire_pump(connection.clone(), wire_receiver, event_bus.clone());
-    spawn_initial_connection(connection.clone(), event_bus.clone());
-    spawn_connection_control(connection, event_bus.clone());
+    spawn_connection_control(connection.clone(), event_bus.clone());
 
     spawn_notifications(event_bus.clone(), config.clone());
     spawn_event_forwarder(event_bus.clone(), app_handle);
@@ -423,6 +424,8 @@ async fn initialize_backend(app_handle: AppHandle) -> Result<AppState, GuiBacken
         EventSource::System(SYSTEM_COMPONENT.to_string()),
         EventPayload::StartupComplete,
     )?;
+
+    spawn_initial_connection(connection, event_bus.clone());
 
     Ok(AppState {
         ui_config,
@@ -580,6 +583,84 @@ fn spawn_connection_control(
                         }
                     }
                     EventPayload::ShutdownRequested { .. } => {
+                        let mut unavailable_subscription =
+                            match event_bus.subscribe("xmpp.presence.own_changed") {
+                                Ok(subscription) => Some(subscription),
+                                Err(error) => {
+                                    emit_component_error(
+                                        &event_bus,
+                                        "presence",
+                                        error.to_string(),
+                                        true,
+                                    );
+                                    None
+                                }
+                            };
+
+                        if let Err(error) = publish_event(
+                            &event_bus,
+                            "ui.presence.set",
+                            EventSource::System(SYSTEM_COMPONENT.to_string()),
+                            EventPayload::PresenceSetRequested {
+                                show: PresenceShow::Unavailable,
+                                status: None,
+                            },
+                        ) {
+                            emit_component_error(&event_bus, "presence", error.to_string(), true);
+                        }
+
+                        let unavailable_seen = if let Some(mut unavailable_subscription) =
+                            unavailable_subscription.take()
+                        {
+                            tokio::time::timeout(
+                                Duration::from_secs(SHUTDOWN_CLEANUP_TIMEOUT_SECONDS),
+                                async {
+                                    loop {
+                                        match unavailable_subscription.recv().await {
+                                            Ok(event) => {
+                                                if matches!(
+                                                    event.payload,
+                                                    EventPayload::OwnPresenceChanged {
+                                                        show: PresenceShow::Unavailable,
+                                                        ..
+                                                    }
+                                                ) {
+                                                    return true;
+                                                }
+                                            }
+                                            Err(waddle_core::error::EventBusError::Lagged(
+                                                count,
+                                            )) => {
+                                                warn!(count, "shutdown presence wait lagged");
+                                            }
+                                            Err(
+                                                waddle_core::error::EventBusError::ChannelClosed,
+                                            ) => {
+                                                return false;
+                                            }
+                                            Err(error) => {
+                                                emit_component_error(
+                                                    &event_bus,
+                                                    "presence",
+                                                    error.to_string(),
+                                                    true,
+                                                );
+                                                return false;
+                                            }
+                                        }
+                                    }
+                                },
+                            )
+                            .await
+                            .unwrap_or_default()
+                        } else {
+                            false
+                        };
+
+                        if !unavailable_seen {
+                            warn!("timed out waiting for unavailable presence during shutdown");
+                        }
+
                         let disconnect_result = {
                             let mut manager = connection.lock().await;
                             manager.disconnect().await
