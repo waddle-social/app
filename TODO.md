@@ -12,7 +12,7 @@
 - [x] Implement hierarchical channel validation (dot-delimited `{domain}.{entity}.{action}` format) and channel helper utilities matching naming rules in `specs/04-events/schema.md`.
 - [x] Implement `EventBus` with one `tokio::sync::broadcast` channel per top-level domain (`system`, `xmpp`, `ui`, `plugin`) and glob-pattern subscription filtering.
 - [x] Add `EventBus` tests for routing correctness, glob filtering, per-domain ordering, correlation ID tracking, and lagged subscriber recovery behaviour.
-- [ ] Implement config loading (`config_path`, TOML parse, environment overrides, validation) per `specs/03-components/core-config.md`.
+- [x] Implement config loading (`config_path`, TOML parse, environment overrides, validation) per `specs/03-components/core-config.md`.
 - [ ] Implement i18n module (Fluent locale negotiation, message resolution) per `specs/03-components/i18n.md`.
 - [ ] Implement theming module (built-in themes, custom theme loading, CSS variable token generation) per `specs/03-components/themes.md`.
 
