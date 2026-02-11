@@ -27,10 +27,10 @@ impl Channel {
             return false;
         }
 
-        // Must be lowercase and only contain a-z, 0-9, and dots
+        // Must be lowercase and only contain a-z, 0-9, underscores, and dots
         if name
             .chars()
-            .any(|c| !matches!(c, 'a'..='z' | '0'..='9' | '.'))
+            .any(|c| !matches!(c, 'a'..='z' | '0'..='9' | '_' | '.'))
         {
             return false;
         }

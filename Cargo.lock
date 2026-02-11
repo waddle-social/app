@@ -6409,7 +6409,10 @@ dependencies = [
 name = "waddle-presence"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "mockall",
+ "thiserror 2.0.18",
+ "tokio",
  "tokio-test",
  "tracing",
  "tracing-test",
