@@ -54,6 +54,7 @@ pub struct UiConfig {
     pub notifications: bool,
     #[serde(default = "default_theme_name")]
     pub theme: String,
+    pub locale: Option<String>,
 }
 
 impl Default for UiConfig {
@@ -61,6 +62,7 @@ impl Default for UiConfig {
         Self {
             notifications: true,
             theme: "default".to_string(),
+            locale: None,
         }
     }
 }

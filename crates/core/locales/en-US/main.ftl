@@ -1,0 +1,17 @@
+app-name = Waddle
+status-connecting = Connecting…
+status-connected = Connected
+status-disconnected = Disconnected
+status-reconnecting = Reconnecting…
+status-available = Available
+status-away = Away
+status-dnd = Do Not Disturb
+status-xa = Extended Away
+status-unavailable = Unavailable
+roster-title = Contacts
+roster-empty = No contacts
+roster-add-contact = Add contact
+roster-remove-contact = Remove contact
+conversation-empty = No messages yet
+conversation-placeholder = Type a message…
+conversation-send = Send

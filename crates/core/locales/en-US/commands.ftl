@@ -1,0 +1,9 @@
+cmd-help = Show available commands
+cmd-quit = Quit Waddle
+cmd-connect = Connect to server
+cmd-disconnect = Disconnect from server
+cmd-status = Set your status
+cmd-join = Join a chat room
+cmd-leave = Leave the current room
+cmd-theme = Switch theme
+cmd-roster = Manage contacts
