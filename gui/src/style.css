@@ -3,21 +3,21 @@
 @tailwind utilities;
 
 :root {
-  --waddle-bg: #f8fafc;
-  --waddle-fg: #0f172a;
-  --waddle-accent: #2563eb;
-  --waddle-surface: #ffffff;
-  --waddle-border: #e2e8f0;
-  --waddle-success: #16a34a;
-  --waddle-warning: #f59e0b;
-  --waddle-error: #dc2626;
-  --waddle-muted: #64748b;
+  --waddle-bg: #ffffff;
+  --waddle-fg: #1a1a1a;
+  --waddle-accent: #0066cc;
+  --waddle-surface: #f5f5f5;
+  --waddle-border: #d4d4d4;
+  --waddle-success: #22863a;
+  --waddle-warning: #b08800;
+  --waddle-error: #cb2431;
+  --waddle-muted: #6a737d;
   font-family: 'Atkinson Hyperlegible', 'Segoe UI', sans-serif;
 }
 
 body {
   margin: 0;
-  background: radial-gradient(circle at top, #dbeafe, #f8fafc 40%);
+  background: var(--waddle-bg);
   color: var(--waddle-fg);
 }
 

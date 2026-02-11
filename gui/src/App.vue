@@ -1,3 +1,9 @@
+<script setup lang="ts">
+import { useTheme } from './composables/useTheme';
+
+useTheme();
+</script>
+
 <template>
   <div class="mx-auto grid min-h-screen max-w-6xl grid-rows-[auto,1fr] gap-4 px-4 py-6 md:px-8">
     <header class="rounded-2xl border border-border bg-surface p-4 shadow-sm">

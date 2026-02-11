@@ -60,7 +60,7 @@
 - [x] Wire TUI command mode (`:` prefix) to domain actions (presence set, theme switching, room join/leave) with i18n message resolution and theme-driven rendering.
 - [x] Implement `waddle-gui-backend` Tauri v2 command handlers, app lifecycle wiring (startup sequence from `specs/01-architecture/overview.md`), and event forwarding to the Vue frontend.
 - [x] Initialise `gui/` with Vue 3 (Composition API) + Vite + Tailwind CSS + Ark UI Vue + Pinia + Vue Router. Create route views and Pinia stores for conversations, roster, settings, and plugins.
-- [ ] Implement the `useWaddle()` composable abstracting Tauri IPC (`invoke()`) vs direct WASM imports (`wasm-bindgen`). Implement plugin SFC dynamic loading and CSS custom property theme switching.
+- [x] Implement the `useWaddle()` composable abstracting Tauri IPC (`invoke()`) vs direct WASM imports (`wasm-bindgen`). Implement plugin SFC dynamic loading and CSS custom property theme switching.
 
 ## 8. Integration, Testing, and Delivery
 - [ ] Implement startup/shutdown orchestration matching the deterministic sequences in `specs/04-events/lifecycle.md` (config → storage → event bus → plugins → XMPP connection → roster → presence → MAM sync).
