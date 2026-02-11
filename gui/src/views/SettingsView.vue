@@ -29,7 +29,7 @@ function onThemeChange(event: Event): void {
         <span class="mb-2 block text-muted">Theme</span>
         <select
           :value="theme"
-          class="w-full rounded border border-border bg-white px-2 py-1"
+          class="w-full rounded border border-border bg-surface px-2 py-1"
           @change="onThemeChange"
         >
           <option value="light">Light</option>

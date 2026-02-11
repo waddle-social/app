@@ -17,7 +17,7 @@
       </div>
     </header>
 
-    <main class="rounded-2xl border border-border bg-white/70 p-4 shadow-sm backdrop-blur-sm md:p-6">
+    <main class="rounded-2xl border border-border bg-surface/70 p-4 shadow-sm backdrop-blur-sm md:p-6">
       <RouterView />
     </main>
   </div>
