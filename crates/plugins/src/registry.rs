@@ -349,6 +349,13 @@ struct PluginIndex {
     plugins: Vec<InstalledPlugin>,
 }
 
+struct PulledPluginArtifact {
+    manifest: PluginManifest,
+    wasm_data: Vec<u8>,
+    vue_data: Option<Vec<u8>>,
+    assets_data: Option<Vec<u8>>,
+}
+
 pub struct PluginRegistry {
     config: RegistryConfig,
     data_dir: PathBuf,
@@ -395,6 +402,15 @@ impl PluginRegistry {
             return self.install_from_local(reference).await;
         }
 
+        self.install_from_oci(reference, false, None).await
+    }
+
+    async fn install_from_oci(
+        &self,
+        reference: &str,
+        allow_replace: bool,
+        expected_plugin_id: Option<&str>,
+    ) -> Result<InstalledPlugin, RegistryError> {
         let oci_ref = self.resolve_reference(reference)?;
         let ref_str = oci_ref.whole();
 
@@ -412,24 +428,43 @@ impl PluginRegistry {
                     reason: err.to_string(),
                 })?;
 
-        let plugin_manifest = self
-            .pull_and_extract_layers(&client, &auth, &oci_ref, &manifest)
-            .await?;
-
+        let artifact = self.pull_layers(&client, &oci_ref, &manifest).await?;
+        let plugin_manifest = &artifact.manifest;
         let plugin_id = plugin_manifest.id().to_string();
 
+        if let Some(expected_id) = expected_plugin_id
+            && plugin_id != expected_id
         {
+            return Err(RegistryError::InvalidManifest {
+                id: plugin_id,
+                reason: format!(
+                    "artifact plugin id does not match update target (expected {expected_id})"
+                ),
+            });
+        }
+
+        let existing_version = {
             let index = self
                 .installed
                 .read()
                 .map_err(|_| RegistryError::Io(std::io::Error::other("lock poisoned")))?;
-            if let Some(existing) = index.plugins.iter().find(|p| p.id == plugin_id) {
-                return Err(RegistryError::AlreadyInstalled {
-                    id: plugin_id,
-                    version: existing.version.clone(),
-                });
-            }
+            index
+                .plugins
+                .iter()
+                .find(|p| p.id == plugin_id)
+                .map(|p| p.version.clone())
+        };
+
+        if let Some(version) = existing_version
+            && !allow_replace
+        {
+            return Err(RegistryError::AlreadyInstalled {
+                id: plugin_id,
+                version,
+            });
         }
+
+        self.write_plugin_files(&plugin_id, &artifact)?;
 
         let entry = InstalledPlugin {
             id: plugin_id.clone(),
@@ -440,7 +475,11 @@ impl PluginRegistry {
             installed_at: Utc::now().to_rfc3339(),
         };
 
-        self.add_to_index(entry.clone())?;
+        if allow_replace {
+            self.upsert_index(entry.clone())?;
+        } else {
+            self.add_to_index(entry.clone())?;
+        }
 
         info!(plugin_id = %plugin_id, "plugin installed");
         Ok(entry)
@@ -580,14 +619,10 @@ impl PluginRegistry {
             "newer version available, updating"
         );
 
-        self.remove_from_index(plugin_id)?;
-        let plugin_dir = self.installed_dir().join(plugin_id);
-        if plugin_dir.exists() {
-            std::fs::remove_dir_all(&plugin_dir)?;
-        }
-
         let new_ref = format!("{base_ref}:{latest}");
-        let result = self.install(&new_ref).await?;
+        let result = self
+            .install_from_oci(&new_ref, true, Some(plugin_id))
+            .await?;
         Ok(Some(result))
     }
 
@@ -734,16 +769,14 @@ impl PluginRegistry {
         )
     }
 
-    async fn pull_and_extract_layers(
+    async fn pull_layers(
         &self,
         client: &Client,
-        _auth: &RegistryAuth,
         oci_ref: &Reference,
         manifest: &OciImageManifest,
-    ) -> Result<PluginManifest, RegistryError> {
+    ) -> Result<PulledPluginArtifact, RegistryError> {
         let ref_str = oci_ref.whole();
         let mut plugin_manifest: Option<PluginManifest> = None;
-        let mut plugin_id: Option<String> = None;
         let mut wasm_data: Option<Vec<u8>> = None;
         let mut vue_data: Option<Vec<u8>> = None;
         let mut assets_data: Option<Vec<u8>> = None;
@@ -794,7 +827,6 @@ impl PluginRegistry {
                             reason: err.to_string(),
                         }
                     })?;
-                    plugin_id = Some(manifest.id().to_string());
                     plugin_manifest = Some(manifest);
                 }
                 MEDIA_TYPE_WASM => {
@@ -817,34 +849,18 @@ impl PluginRegistry {
             reason: "no manifest layer found in OCI artifact".to_string(),
         })?;
 
-        let plugin_id = plugin_id.unwrap();
-
+        let plugin_id = plugin_manifest.id().to_string();
         let wasm_data = wasm_data.ok_or_else(|| RegistryError::InvalidManifest {
             id: plugin_id.clone(),
             reason: "no WASM layer found in OCI artifact".to_string(),
         })?;
 
-        let dest_dir = self.installed_dir().join(&plugin_id);
-        std::fs::create_dir_all(&dest_dir)?;
-
-        let manifest_toml = toml::to_string_pretty(&plugin_manifest).map_err(|err| {
-            RegistryError::InvalidManifest {
-                id: plugin_id.clone(),
-                reason: format!("failed to serialize manifest: {err}"),
-            }
-        })?;
-        std::fs::write(dest_dir.join("manifest.toml"), manifest_toml)?;
-        std::fs::write(dest_dir.join("plugin.wasm"), wasm_data)?;
-
-        if let Some(vue_tar) = vue_data {
-            extract_tar(&vue_tar, &dest_dir.join("vue"))?;
-        }
-
-        if let Some(assets_tar) = assets_data {
-            extract_tar(&assets_tar, &dest_dir.join("assets"))?;
-        }
-
-        Ok(plugin_manifest)
+        Ok(PulledPluginArtifact {
+            manifest: plugin_manifest,
+            wasm_data,
+            vue_data,
+            assets_data,
+        })
     }
 
     fn add_to_index(&self, entry: InstalledPlugin) -> Result<(), RegistryError> {
@@ -864,6 +880,68 @@ impl PluginRegistry {
             .map_err(|_| RegistryError::Io(std::io::Error::other("lock poisoned")))?;
         index.plugins.retain(|p| p.id != plugin_id);
         save_index(&self.plugins_dir(), &index)?;
+        Ok(())
+    }
+
+    fn upsert_index(&self, entry: InstalledPlugin) -> Result<(), RegistryError> {
+        let mut index = self
+            .installed
+            .write()
+            .map_err(|_| RegistryError::Io(std::io::Error::other("lock poisoned")))?;
+        index.plugins.retain(|plugin| plugin.id != entry.id);
+        index.plugins.push(entry);
+        save_index(&self.plugins_dir(), &index)?;
+        Ok(())
+    }
+
+    fn write_plugin_files(
+        &self,
+        plugin_id: &str,
+        artifact: &PulledPluginArtifact,
+    ) -> Result<(), RegistryError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let installed_dir = self.installed_dir();
+        std::fs::create_dir_all(&installed_dir)?;
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let staging_dir = installed_dir.join(format!(".tmp-{plugin_id}-{nonce}"));
+
+        std::fs::create_dir_all(&staging_dir)?;
+
+        let write_result: Result<(), RegistryError> = (|| {
+            let manifest_toml = toml::to_string_pretty(&artifact.manifest).map_err(|err| {
+                RegistryError::InvalidManifest {
+                    id: plugin_id.to_string(),
+                    reason: format!("failed to serialize manifest: {err}"),
+                }
+            })?;
+            std::fs::write(staging_dir.join("manifest.toml"), manifest_toml)?;
+            std::fs::write(staging_dir.join("plugin.wasm"), &artifact.wasm_data)?;
+
+            if let Some(vue_tar) = &artifact.vue_data {
+                extract_tar(vue_tar, &staging_dir.join("vue"))?;
+            }
+
+            if let Some(assets_tar) = &artifact.assets_data {
+                extract_tar(assets_tar, &staging_dir.join("assets"))?;
+            }
+
+            Ok(())
+        })();
+
+        if let Err(err) = write_result {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(err);
+        }
+
+        let dest_dir = installed_dir.join(plugin_id);
+        if dest_dir.exists() {
+            std::fs::remove_dir_all(&dest_dir)?;
+        }
+        std::fs::rename(&staging_dir, &dest_dir)?;
         Ok(())
     }
 }
@@ -1725,6 +1803,105 @@ i18n_dir = "i18n/"
         assert!(files.assets_dir.is_some());
         assert!(files.vue_dir.unwrap().join("Settings.vue").exists());
         assert!(files.assets_dir.as_ref().unwrap().join("icon.svg").exists());
+    }
+
+    #[test]
+    fn write_plugin_files_replaces_existing_plugin_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry =
+            PluginRegistry::new(RegistryConfig::default(), dir.path().to_path_buf()).unwrap();
+        let plugin_id = "com.test.replace";
+
+        let initial = PulledPluginArtifact {
+            manifest: test_manifest(plugin_id, "1.0.0"),
+            wasm_data: b"v1".to_vec(),
+            vue_data: Some(tar_bytes(&[("Settings.vue", b"<template>v1</template>")])),
+            assets_data: Some(tar_bytes(&[("icon.svg", b"<svg/>")])),
+        };
+        registry.write_plugin_files(plugin_id, &initial).unwrap();
+
+        let replacement = PulledPluginArtifact {
+            manifest: test_manifest(plugin_id, "1.1.0"),
+            wasm_data: b"v2".to_vec(),
+            vue_data: None,
+            assets_data: None,
+        };
+        registry
+            .write_plugin_files(plugin_id, &replacement)
+            .unwrap();
+
+        let plugin_dir = registry.installed_dir().join(plugin_id);
+        assert_eq!(
+            std::fs::read(plugin_dir.join("plugin.wasm")).unwrap(),
+            b"v2"
+        );
+        assert!(!plugin_dir.join("vue").exists());
+        assert!(!plugin_dir.join("assets").exists());
+    }
+
+    #[test]
+    fn write_plugin_files_failure_keeps_existing_plugin_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry =
+            PluginRegistry::new(RegistryConfig::default(), dir.path().to_path_buf()).unwrap();
+        let plugin_id = "com.test.replace";
+
+        let initial = PulledPluginArtifact {
+            manifest: test_manifest(plugin_id, "1.0.0"),
+            wasm_data: b"stable".to_vec(),
+            vue_data: None,
+            assets_data: None,
+        };
+        registry.write_plugin_files(plugin_id, &initial).unwrap();
+
+        let broken = PulledPluginArtifact {
+            manifest: test_manifest(plugin_id, "1.1.0"),
+            wasm_data: b"broken".to_vec(),
+            vue_data: Some(vec![0, 1, 2, 3]),
+            assets_data: None,
+        };
+        let err = registry.write_plugin_files(plugin_id, &broken).unwrap_err();
+        assert!(matches!(err, RegistryError::Io(_)));
+
+        let plugin_dir = registry.installed_dir().join(plugin_id);
+        assert_eq!(
+            std::fs::read(plugin_dir.join("plugin.wasm")).unwrap(),
+            b"stable"
+        );
+    }
+
+    fn test_manifest(plugin_id: &str, version: &str) -> PluginManifest {
+        let manifest_toml = format!(
+            r#"
+[plugin]
+id = "{plugin_id}"
+name = "Test Plugin"
+version = "{version}"
+description = "Test plugin manifest"
+
+[permissions]
+
+[hooks]
+"#
+        );
+        PluginManifest::from_toml_str(&manifest_toml).unwrap()
+    }
+
+    fn tar_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut builder = tar::Builder::new(&mut bytes);
+            for (path, contents) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_size(contents.len() as u64);
+                header.set_mode(0o644);
+                header.set_mtime(0);
+                header.set_cksum();
+                builder.append_data(&mut header, *path, *contents).unwrap();
+            }
+            builder.finish().unwrap();
+        }
+        bytes
     }
 
     impl PluginManifest {
