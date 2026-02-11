@@ -573,14 +573,10 @@ impl WebDatabase {
     /// In the future this will initialise wa-sqlite with OPFS/IndexedDB backing
     /// and run pending migrations. Currently returns a stub that errors on all
     /// operations.
-    pub async fn open(path: &Path) -> Result<Self, StorageError> {
-        let name = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(WEB_DATABASE_NAME)
-            .to_string();
-
-        Ok(Self { name })
+    pub async fn open(_path: &Path) -> Result<Self, StorageError> {
+        Ok(Self {
+            name: WEB_DATABASE_NAME.to_string(),
+        })
     }
 
     pub fn name(&self) -> &str {
