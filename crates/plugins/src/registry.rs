@@ -2,10 +2,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use chrono::Utc;
 use glob::Pattern;
+use oci_distribution::Reference;
+use oci_distribution::client::{Client, ClientConfig};
+use oci_distribution::manifest::OciImageManifest;
+use oci_distribution::secrets::RegistryAuth;
 use semver::Version;
+use sha2::{Digest, Sha256};
+use tracing::{debug, info, warn};
 
 const VALID_EVENT_DOMAINS: &[&str] = &["system", "xmpp", "ui", "plugin"];
+
+const MEDIA_TYPE_MANIFEST: &str = "application/vnd.waddle.plugin.manifest.v1+toml";
+const MEDIA_TYPE_WASM: &str = "application/vnd.waddle.plugin.wasm.v1+wasm";
+const MEDIA_TYPE_VUE: &str = "application/vnd.waddle.plugin.vue.v1+tar";
+const MEDIA_TYPE_ASSETS: &str = "application/vnd.waddle.plugin.assets.v1+tar";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryConfig {
@@ -274,12 +286,14 @@ pub enum PermissionPolicyError {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InstalledPlugin {
     pub id: String,
     pub name: String,
     pub version: String,
     pub source: String,
+    #[serde(default)]
+    pub digest: Option<String>,
     pub installed_at: String,
 }
 
@@ -322,27 +336,37 @@ pub enum RegistryError {
     #[error("registry authentication failed for {registry}: {reason}")]
     AuthenticationFailed { registry: String, reason: String },
 
-    #[error("plugin registry is not implemented")]
-    NotImplemented,
-
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("manifest error: {0}")]
+    Manifest(#[from] ManifestError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+struct PluginIndex {
+    #[serde(default)]
+    plugins: Vec<InstalledPlugin>,
 }
 
 pub struct PluginRegistry {
     config: RegistryConfig,
     data_dir: PathBuf,
-    installed: RwLock<Vec<InstalledPlugin>>,
+    installed: RwLock<PluginIndex>,
 }
 
 impl PluginRegistry {
     pub fn new(config: RegistryConfig, data_dir: PathBuf) -> Result<Self, RegistryError> {
-        std::fs::create_dir_all(data_dir.join("plugins"))?;
+        let plugins_dir = data_dir.join("plugins");
+        std::fs::create_dir_all(plugins_dir.join("cache"))?;
+        std::fs::create_dir_all(plugins_dir.join("installed"))?;
+
+        let index = load_index(&plugins_dir);
 
         Ok(Self {
             config,
             data_dir,
-            installed: RwLock::new(Vec::new()),
+            installed: RwLock::new(index),
         })
     }
 
@@ -354,42 +378,543 @@ impl PluginRegistry {
         &self.data_dir
     }
 
-    pub async fn install(&self, _reference: &str) -> Result<InstalledPlugin, RegistryError> {
-        Err(RegistryError::NotImplemented)
+    fn plugins_dir(&self) -> PathBuf {
+        self.data_dir.join("plugins")
     }
 
-    pub async fn uninstall(&self, _plugin_id: &str) -> Result<(), RegistryError> {
-        Err(RegistryError::NotImplemented)
+    fn installed_dir(&self) -> PathBuf {
+        self.plugins_dir().join("installed")
     }
 
-    pub async fn update(&self, _plugin_id: &str) -> Result<Option<InstalledPlugin>, RegistryError> {
-        Err(RegistryError::NotImplemented)
+    fn cache_dir(&self) -> PathBuf {
+        self.plugins_dir().join("cache")
+    }
+
+    pub async fn install(&self, reference: &str) -> Result<InstalledPlugin, RegistryError> {
+        if Path::new(reference).is_dir() {
+            return self.install_from_local(reference).await;
+        }
+
+        let oci_ref = self.resolve_reference(reference)?;
+        let ref_str = oci_ref.whole();
+
+        info!(reference = %ref_str, "installing plugin from OCI registry");
+
+        let client = Client::new(ClientConfig::default());
+        let auth = RegistryAuth::Anonymous;
+
+        let (manifest, digest) =
+            client
+                .pull_image_manifest(&oci_ref, &auth)
+                .await
+                .map_err(|err| RegistryError::PullFailed {
+                    reference: ref_str.clone(),
+                    reason: err.to_string(),
+                })?;
+
+        let plugin_manifest = self
+            .pull_and_extract_layers(&client, &auth, &oci_ref, &manifest)
+            .await?;
+
+        let plugin_id = plugin_manifest.id().to_string();
+
+        {
+            let index = self
+                .installed
+                .read()
+                .map_err(|_| RegistryError::Io(std::io::Error::other("lock poisoned")))?;
+            if let Some(existing) = index.plugins.iter().find(|p| p.id == plugin_id) {
+                return Err(RegistryError::AlreadyInstalled {
+                    id: plugin_id,
+                    version: existing.version.clone(),
+                });
+            }
+        }
+
+        let entry = InstalledPlugin {
+            id: plugin_id.clone(),
+            name: plugin_manifest.name().to_string(),
+            version: plugin_manifest.version().to_string(),
+            source: ref_str,
+            digest: Some(digest),
+            installed_at: Utc::now().to_rfc3339(),
+        };
+
+        self.add_to_index(entry.clone())?;
+
+        info!(plugin_id = %plugin_id, "plugin installed");
+        Ok(entry)
+    }
+
+    async fn install_from_local(&self, path: &str) -> Result<InstalledPlugin, RegistryError> {
+        let source_dir = Path::new(path);
+        let manifest_path = source_dir.join("manifest.toml");
+        let wasm_path = source_dir.join("plugin.wasm");
+
+        let plugin_manifest = PluginManifest::from_path(&manifest_path)?;
+
+        if !wasm_path.exists() {
+            return Err(RegistryError::InvalidManifest {
+                id: plugin_manifest.id().to_string(),
+                reason: "plugin.wasm not found in source directory".to_string(),
+            });
+        }
+
+        let plugin_id = plugin_manifest.id().to_string();
+
+        {
+            let index = self
+                .installed
+                .read()
+                .map_err(|_| RegistryError::Io(std::io::Error::other("lock poisoned")))?;
+            if let Some(existing) = index.plugins.iter().find(|p| p.id == plugin_id) {
+                return Err(RegistryError::AlreadyInstalled {
+                    id: plugin_id,
+                    version: existing.version.clone(),
+                });
+            }
+        }
+
+        let dest_dir = self.installed_dir().join(&plugin_id);
+        std::fs::create_dir_all(&dest_dir)?;
+
+        std::fs::copy(&manifest_path, dest_dir.join("manifest.toml"))?;
+        std::fs::copy(&wasm_path, dest_dir.join("plugin.wasm"))?;
+
+        let vue_src = source_dir.join("vue");
+        if vue_src.is_dir() {
+            copy_dir_recursive(&vue_src, &dest_dir.join("vue"))?;
+        }
+
+        let assets_src = source_dir.join("assets");
+        if assets_src.is_dir() {
+            copy_dir_recursive(&assets_src, &dest_dir.join("assets"))?;
+        }
+
+        let entry = InstalledPlugin {
+            id: plugin_id.clone(),
+            name: plugin_manifest.name().to_string(),
+            version: plugin_manifest.version().to_string(),
+            source: path.to_string(),
+            digest: None,
+            installed_at: Utc::now().to_rfc3339(),
+        };
+
+        self.add_to_index(entry.clone())?;
+
+        info!(plugin_id = %plugin_id, source = %path, "plugin installed from local directory");
+        Ok(entry)
+    }
+
+    pub async fn uninstall(&self, plugin_id: &str) -> Result<(), RegistryError> {
+        {
+            let index = self
+                .installed
+                .read()
+                .map_err(|_| RegistryError::Io(std::io::Error::other("lock poisoned")))?;
+            if !index.plugins.iter().any(|p| p.id == plugin_id) {
+                return Err(RegistryError::NotInstalled {
+                    id: plugin_id.to_string(),
+                });
+            }
+        }
+
+        let plugin_dir = self.installed_dir().join(plugin_id);
+        if plugin_dir.exists() {
+            std::fs::remove_dir_all(&plugin_dir)?;
+        }
+
+        self.remove_from_index(plugin_id)?;
+
+        info!(plugin_id = %plugin_id, "plugin uninstalled");
+        Ok(())
+    }
+
+    pub async fn update(&self, plugin_id: &str) -> Result<Option<InstalledPlugin>, RegistryError> {
+        let (source, current_version) = {
+            let index = self
+                .installed
+                .read()
+                .map_err(|_| RegistryError::Io(std::io::Error::other("lock poisoned")))?;
+            let entry = index
+                .plugins
+                .iter()
+                .find(|p| p.id == plugin_id)
+                .ok_or_else(|| RegistryError::NotInstalled {
+                    id: plugin_id.to_string(),
+                })?;
+            (entry.source.clone(), entry.version.clone())
+        };
+
+        if Path::new(&source).is_dir() {
+            debug!(plugin_id = %plugin_id, "skipping update for local plugin");
+            return Ok(None);
+        }
+
+        let oci_ref = self.resolve_reference(&source)?;
+        let base_ref = format!("{}/{}", oci_ref.registry(), oci_ref.repository());
+
+        let versions = self.list_versions(&base_ref).await?;
+
+        let current =
+            Version::parse(&current_version).map_err(|err| RegistryError::ResolveFailed {
+                reference: source.clone(),
+                reason: format!("invalid installed version: {err}"),
+            })?;
+
+        let latest = versions.iter().filter_map(|v| Version::parse(v).ok()).max();
+
+        let Some(latest) = latest else {
+            return Ok(None);
+        };
+
+        if latest <= current {
+            debug!(plugin_id = %plugin_id, current = %current, "already at latest version");
+            return Ok(None);
+        }
+
+        info!(
+            plugin_id = %plugin_id,
+            current = %current,
+            latest = %latest,
+            "newer version available, updating"
+        );
+
+        self.remove_from_index(plugin_id)?;
+        let plugin_dir = self.installed_dir().join(plugin_id);
+        if plugin_dir.exists() {
+            std::fs::remove_dir_all(&plugin_dir)?;
+        }
+
+        let new_ref = format!("{base_ref}:{latest}");
+        let result = self.install(&new_ref).await?;
+        Ok(Some(result))
     }
 
     pub async fn search(
         &self,
-        _registry: &str,
-        _query: &str,
+        registry: &str,
+        query: &str,
     ) -> Result<Vec<PluginSummary>, RegistryError> {
-        Err(RegistryError::NotImplemented)
+        let ref_str = if registry.contains('/') {
+            registry.to_string()
+        } else {
+            format!("{}/{query}", self.config.default_registry)
+        };
+
+        let oci_ref: Reference = ref_str
+            .parse()
+            .map_err(
+                |err: oci_distribution::ParseError| RegistryError::ResolveFailed {
+                    reference: ref_str.clone(),
+                    reason: err.to_string(),
+                },
+            )?;
+
+        let client = Client::new(ClientConfig::default());
+        let auth = RegistryAuth::Anonymous;
+
+        let tag_response = client
+            .list_tags(&oci_ref, &auth, None, None)
+            .await
+            .map_err(|err| RegistryError::ResolveFailed {
+                reference: ref_str.clone(),
+                reason: err.to_string(),
+            })?;
+
+        let mut summaries = Vec::new();
+        for tag in &tag_response.tags {
+            if !query.is_empty() && !tag.contains(query) && !tag_response.name.contains(query) {
+                continue;
+            }
+
+            summaries.push(PluginSummary {
+                reference: format!("{}:{tag}", ref_str),
+                name: tag_response.name.clone(),
+                description: String::new(),
+                latest_version: tag.clone(),
+            });
+        }
+
+        Ok(summaries)
     }
 
     pub fn list_installed(&self) -> Result<Vec<InstalledPlugin>, RegistryError> {
-        let installed = self
+        let index = self
             .installed
             .read()
-            .map_err(|_| RegistryError::NotImplemented)?;
+            .map_err(|_| RegistryError::Io(std::io::Error::other("lock poisoned")))?;
 
-        Ok(installed.clone())
+        Ok(index.plugins.clone())
     }
 
-    pub fn get_plugin_files(&self, _plugin_id: &str) -> Result<PluginFiles, RegistryError> {
-        Err(RegistryError::NotImplemented)
+    pub fn get_plugin_files(&self, plugin_id: &str) -> Result<PluginFiles, RegistryError> {
+        {
+            let index = self
+                .installed
+                .read()
+                .map_err(|_| RegistryError::Io(std::io::Error::other("lock poisoned")))?;
+            if !index.plugins.iter().any(|p| p.id == plugin_id) {
+                return Err(RegistryError::NotInstalled {
+                    id: plugin_id.to_string(),
+                });
+            }
+        }
+
+        let plugin_dir = self.installed_dir().join(plugin_id);
+        let manifest_path = plugin_dir.join("manifest.toml");
+        let wasm_path = plugin_dir.join("plugin.wasm");
+
+        let manifest = PluginManifest::from_path(&manifest_path)?;
+
+        let vue_dir = plugin_dir.join("vue");
+        let vue_dir = if vue_dir.is_dir() {
+            Some(vue_dir)
+        } else {
+            None
+        };
+
+        let assets_dir = plugin_dir.join("assets");
+        let assets_dir = if assets_dir.is_dir() {
+            Some(assets_dir)
+        } else {
+            None
+        };
+
+        Ok(PluginFiles {
+            manifest,
+            wasm_path,
+            vue_dir,
+            assets_dir,
+        })
     }
 
-    pub async fn list_versions(&self, _reference: &str) -> Result<Vec<String>, RegistryError> {
-        Err(RegistryError::NotImplemented)
+    pub async fn list_versions(&self, reference: &str) -> Result<Vec<String>, RegistryError> {
+        let oci_ref = self.resolve_reference(reference)?;
+        let ref_str = oci_ref.whole();
+
+        let client = Client::new(ClientConfig::default());
+        let auth = RegistryAuth::Anonymous;
+
+        let tag_response = client
+            .list_tags(&oci_ref, &auth, None, None)
+            .await
+            .map_err(|err| RegistryError::ResolveFailed {
+                reference: ref_str.clone(),
+                reason: err.to_string(),
+            })?;
+
+        let mut versions: Vec<String> = tag_response
+            .tags
+            .into_iter()
+            .filter(|tag| Version::parse(tag).is_ok())
+            .collect();
+
+        versions.sort_by(|a, b| {
+            let va = Version::parse(a).unwrap();
+            let vb = Version::parse(b).unwrap();
+            va.cmp(&vb)
+        });
+
+        Ok(versions)
     }
+
+    fn resolve_reference(&self, reference: &str) -> Result<Reference, RegistryError> {
+        let expanded = if reference.contains('/') {
+            reference.to_string()
+        } else {
+            format!("{}/{reference}", self.config.default_registry)
+        };
+
+        expanded.parse().map_err(
+            |err: oci_distribution::ParseError| RegistryError::ResolveFailed {
+                reference: reference.to_string(),
+                reason: err.to_string(),
+            },
+        )
+    }
+
+    async fn pull_and_extract_layers(
+        &self,
+        client: &Client,
+        _auth: &RegistryAuth,
+        oci_ref: &Reference,
+        manifest: &OciImageManifest,
+    ) -> Result<PluginManifest, RegistryError> {
+        let ref_str = oci_ref.whole();
+        let mut plugin_manifest: Option<PluginManifest> = None;
+        let mut plugin_id: Option<String> = None;
+        let mut wasm_data: Option<Vec<u8>> = None;
+        let mut vue_data: Option<Vec<u8>> = None;
+        let mut assets_data: Option<Vec<u8>> = None;
+
+        for layer in &manifest.layers {
+            let mut buf = Vec::new();
+
+            let cache_key = layer.digest.replace(':', "-");
+            let cache_path = self.cache_dir().join(&cache_key);
+
+            if cache_path.exists() {
+                debug!(digest = %layer.digest, "using cached layer");
+                buf = std::fs::read(&cache_path)?;
+            } else {
+                debug!(digest = %layer.digest, media_type = %layer.media_type, "pulling layer");
+                client
+                    .pull_blob(oci_ref, layer, &mut buf)
+                    .await
+                    .map_err(|err| RegistryError::PullFailed {
+                        reference: ref_str.clone(),
+                        reason: format!("failed to pull layer {}: {err}", layer.digest),
+                    })?;
+
+                let computed_digest = format!("sha256:{:x}", Sha256::digest(&buf));
+                if computed_digest != layer.digest {
+                    return Err(RegistryError::PullFailed {
+                        reference: ref_str.clone(),
+                        reason: format!(
+                            "digest mismatch for layer: expected {}, got {computed_digest}",
+                            layer.digest
+                        ),
+                    });
+                }
+
+                std::fs::write(&cache_path, &buf)?;
+            }
+
+            match layer.media_type.as_str() {
+                MEDIA_TYPE_MANIFEST => {
+                    let toml_str =
+                        String::from_utf8(buf).map_err(|_| RegistryError::InvalidManifest {
+                            id: "unknown".to_string(),
+                            reason: "manifest layer is not valid UTF-8".to_string(),
+                        })?;
+                    let manifest = PluginManifest::from_toml_str(&toml_str).map_err(|err| {
+                        RegistryError::InvalidManifest {
+                            id: "unknown".to_string(),
+                            reason: err.to_string(),
+                        }
+                    })?;
+                    plugin_id = Some(manifest.id().to_string());
+                    plugin_manifest = Some(manifest);
+                }
+                MEDIA_TYPE_WASM => {
+                    wasm_data = Some(buf);
+                }
+                MEDIA_TYPE_VUE => {
+                    vue_data = Some(buf);
+                }
+                MEDIA_TYPE_ASSETS => {
+                    assets_data = Some(buf);
+                }
+                other => {
+                    warn!(media_type = %other, "ignoring layer with unrecognized media type");
+                }
+            }
+        }
+
+        let plugin_manifest = plugin_manifest.ok_or_else(|| RegistryError::InvalidManifest {
+            id: "unknown".to_string(),
+            reason: "no manifest layer found in OCI artifact".to_string(),
+        })?;
+
+        let plugin_id = plugin_id.unwrap();
+
+        let wasm_data = wasm_data.ok_or_else(|| RegistryError::InvalidManifest {
+            id: plugin_id.clone(),
+            reason: "no WASM layer found in OCI artifact".to_string(),
+        })?;
+
+        let dest_dir = self.installed_dir().join(&plugin_id);
+        std::fs::create_dir_all(&dest_dir)?;
+
+        let manifest_toml = toml::to_string_pretty(&plugin_manifest).map_err(|err| {
+            RegistryError::InvalidManifest {
+                id: plugin_id.clone(),
+                reason: format!("failed to serialize manifest: {err}"),
+            }
+        })?;
+        std::fs::write(dest_dir.join("manifest.toml"), manifest_toml)?;
+        std::fs::write(dest_dir.join("plugin.wasm"), wasm_data)?;
+
+        if let Some(vue_tar) = vue_data {
+            extract_tar(&vue_tar, &dest_dir.join("vue"))?;
+        }
+
+        if let Some(assets_tar) = assets_data {
+            extract_tar(&assets_tar, &dest_dir.join("assets"))?;
+        }
+
+        Ok(plugin_manifest)
+    }
+
+    fn add_to_index(&self, entry: InstalledPlugin) -> Result<(), RegistryError> {
+        let mut index = self
+            .installed
+            .write()
+            .map_err(|_| RegistryError::Io(std::io::Error::other("lock poisoned")))?;
+        index.plugins.push(entry);
+        save_index(&self.plugins_dir(), &index)?;
+        Ok(())
+    }
+
+    fn remove_from_index(&self, plugin_id: &str) -> Result<(), RegistryError> {
+        let mut index = self
+            .installed
+            .write()
+            .map_err(|_| RegistryError::Io(std::io::Error::other("lock poisoned")))?;
+        index.plugins.retain(|p| p.id != plugin_id);
+        save_index(&self.plugins_dir(), &index)?;
+        Ok(())
+    }
+}
+
+fn load_index(plugins_dir: &Path) -> PluginIndex {
+    let index_path = plugins_dir.join("index.toml");
+    if !index_path.exists() {
+        return PluginIndex::default();
+    }
+
+    match std::fs::read_to_string(&index_path) {
+        Ok(contents) => toml::from_str(&contents).unwrap_or_default(),
+        Err(err) => {
+            warn!(path = %index_path.display(), %err, "failed to read plugin index, starting fresh");
+            PluginIndex::default()
+        }
+    }
+}
+
+fn save_index(plugins_dir: &Path, index: &PluginIndex) -> Result<(), RegistryError> {
+    let index_path = plugins_dir.join("index.toml");
+    let contents = toml::to_string_pretty(index)
+        .map_err(|err| std::io::Error::other(format!("failed to serialize index: {err}")))?;
+    std::fs::write(index_path, contents)?;
+    Ok(())
+}
+
+fn extract_tar(tar_data: &[u8], dest_dir: &Path) -> Result<(), RegistryError> {
+    std::fs::create_dir_all(dest_dir)?;
+
+    let mut archive = tar::Archive::new(tar_data);
+    archive
+        .unpack(dest_dir)
+        .map_err(|err| std::io::Error::other(format!("failed to extract tar: {err}")))?;
+
+    Ok(())
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let entry_path = entry.path();
+        let dest_path = dst.join(entry.file_name());
+        if entry_path.is_dir() {
+            copy_dir_recursive(&entry_path, &dest_path)?;
+        } else {
+            std::fs::copy(&entry_path, &dest_path)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_plugin_metadata(metadata: &PluginMetadata) -> Result<(), ManifestError> {
@@ -918,6 +1443,288 @@ gui_metadata = false
             error,
             PermissionPolicyError::InvalidOverride { permission, .. } if permission == "kv_storage"
         ));
+    }
+
+    #[test]
+    fn registry_creates_directory_structure() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry =
+            PluginRegistry::new(RegistryConfig::default(), dir.path().to_path_buf()).unwrap();
+
+        assert!(registry.plugins_dir().join("cache").is_dir());
+        assert!(registry.plugins_dir().join("installed").is_dir());
+    }
+
+    #[test]
+    fn registry_loads_empty_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry =
+            PluginRegistry::new(RegistryConfig::default(), dir.path().to_path_buf()).unwrap();
+
+        let installed = registry.list_installed().unwrap();
+        assert!(installed.is_empty());
+    }
+
+    #[test]
+    fn registry_persists_and_loads_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+
+        {
+            let registry =
+                PluginRegistry::new(RegistryConfig::default(), data_dir.clone()).unwrap();
+            let entry = InstalledPlugin {
+                id: "com.test.plugin".to_string(),
+                name: "Test Plugin".to_string(),
+                version: "1.0.0".to_string(),
+                source: "ghcr.io/test/plugin:1.0.0".to_string(),
+                digest: Some("sha256:abc123".to_string()),
+                installed_at: "2026-01-01T00:00:00Z".to_string(),
+            };
+            registry.add_to_index(entry).unwrap();
+        }
+
+        {
+            let registry = PluginRegistry::new(RegistryConfig::default(), data_dir).unwrap();
+            let installed = registry.list_installed().unwrap();
+            assert_eq!(installed.len(), 1);
+            assert_eq!(installed[0].id, "com.test.plugin");
+            assert_eq!(installed[0].version, "1.0.0");
+        }
+    }
+
+    #[test]
+    fn registry_uninstall_removes_from_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let registry = PluginRegistry::new(RegistryConfig::default(), data_dir).unwrap();
+
+        let plugin_dir = registry.installed_dir().join("com.test.plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"fake").unwrap();
+
+        let entry = InstalledPlugin {
+            id: "com.test.plugin".to_string(),
+            name: "Test Plugin".to_string(),
+            version: "1.0.0".to_string(),
+            source: "local".to_string(),
+            digest: None,
+            installed_at: "2026-01-01T00:00:00Z".to_string(),
+        };
+        registry.add_to_index(entry).unwrap();
+
+        assert_eq!(registry.list_installed().unwrap().len(), 1);
+
+        tokio_test::block_on(registry.uninstall("com.test.plugin")).unwrap();
+
+        assert!(registry.list_installed().unwrap().is_empty());
+        assert!(!plugin_dir.exists());
+    }
+
+    #[test]
+    fn registry_uninstall_not_installed_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry =
+            PluginRegistry::new(RegistryConfig::default(), dir.path().to_path_buf()).unwrap();
+
+        let err = tokio_test::block_on(registry.uninstall("com.test.nonexistent")).unwrap_err();
+        assert!(matches!(err, RegistryError::NotInstalled { .. }));
+    }
+
+    #[tokio::test]
+    async fn registry_install_from_local_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        let manifest_toml = r#"
+[plugin]
+id = "com.test.local"
+name = "Local Plugin"
+version = "0.1.0"
+description = "A test plugin loaded from a local directory"
+
+[permissions]
+kv_storage = true
+
+[hooks]
+event_handler = false
+"#;
+        std::fs::write(source_dir.join("manifest.toml"), manifest_toml).unwrap();
+        std::fs::write(source_dir.join("plugin.wasm"), b"fake-wasm-binary").unwrap();
+
+        let registry = PluginRegistry::new(RegistryConfig::default(), data_dir).unwrap();
+        let installed = registry
+            .install(source_dir.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(installed.id, "com.test.local");
+        assert_eq!(installed.version, "0.1.0");
+        assert!(installed.digest.is_none());
+
+        let files = registry.get_plugin_files("com.test.local").unwrap();
+        assert_eq!(files.manifest.id(), "com.test.local");
+        assert!(files.wasm_path.exists());
+    }
+
+    #[tokio::test]
+    async fn registry_install_local_rejects_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(&source_dir).unwrap();
+
+        let manifest_toml = r#"
+[plugin]
+id = "com.test.dup"
+name = "Dup Plugin"
+version = "0.1.0"
+description = "A duplicate test"
+
+[permissions]
+
+[hooks]
+"#;
+        std::fs::write(source_dir.join("manifest.toml"), manifest_toml).unwrap();
+        std::fs::write(source_dir.join("plugin.wasm"), b"fake").unwrap();
+
+        let registry = PluginRegistry::new(RegistryConfig::default(), data_dir).unwrap();
+        registry
+            .install(source_dir.to_str().unwrap())
+            .await
+            .unwrap();
+
+        let err = registry
+            .install(source_dir.to_str().unwrap())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::AlreadyInstalled { .. }));
+    }
+
+    #[test]
+    fn get_plugin_files_not_installed_returns_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry =
+            PluginRegistry::new(RegistryConfig::default(), dir.path().to_path_buf()).unwrap();
+
+        let err = registry.get_plugin_files("com.test.missing").unwrap_err();
+        assert!(matches!(err, RegistryError::NotInstalled { .. }));
+    }
+
+    #[test]
+    fn resolve_reference_expands_short_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry =
+            PluginRegistry::new(RegistryConfig::default(), dir.path().to_path_buf()).unwrap();
+
+        let oci_ref = registry.resolve_reference("omemo:1.0.0").unwrap();
+        assert_eq!(oci_ref.registry(), "ghcr.io");
+        assert_eq!(oci_ref.repository(), "waddle-social/omemo");
+        assert_eq!(oci_ref.tag(), Some("1.0.0"));
+    }
+
+    #[test]
+    fn resolve_reference_keeps_full_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry =
+            PluginRegistry::new(RegistryConfig::default(), dir.path().to_path_buf()).unwrap();
+
+        let oci_ref = registry
+            .resolve_reference("docker.io/myorg/plugin:2.0.0")
+            .unwrap();
+        assert_eq!(oci_ref.registry(), "docker.io");
+        assert_eq!(oci_ref.repository(), "myorg/plugin");
+        assert_eq!(oci_ref.tag(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn plugin_index_serializes_roundtrip() {
+        let index = PluginIndex {
+            plugins: vec![
+                InstalledPlugin {
+                    id: "com.waddle.omemo".to_string(),
+                    name: "OMEMO Encryption".to_string(),
+                    version: "1.0.0".to_string(),
+                    source: "ghcr.io/waddle-social/omemo:1.0.0".to_string(),
+                    digest: Some("sha256:abcdef".to_string()),
+                    installed_at: "2026-02-10T12:00:00Z".to_string(),
+                },
+                InstalledPlugin {
+                    id: "com.example.test".to_string(),
+                    name: "Test".to_string(),
+                    version: "0.1.0".to_string(),
+                    source: "/home/user/dev/test/".to_string(),
+                    digest: None,
+                    installed_at: "2026-02-10T13:00:00Z".to_string(),
+                },
+            ],
+        };
+
+        let serialized = toml::to_string_pretty(&index).unwrap();
+        let deserialized: PluginIndex = toml::from_str(&serialized).unwrap();
+        assert_eq!(index.plugins.len(), deserialized.plugins.len());
+        assert_eq!(index.plugins[0].id, deserialized.plugins[0].id);
+        assert_eq!(index.plugins[1].id, deserialized.plugins[1].id);
+    }
+
+    #[tokio::test]
+    async fn registry_install_local_with_vue_and_assets() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().join("data");
+        let source_dir = dir.path().join("source");
+        std::fs::create_dir_all(source_dir.join("vue")).unwrap();
+        std::fs::create_dir_all(source_dir.join("assets/i18n")).unwrap();
+
+        let manifest_toml = r#"
+[plugin]
+id = "com.test.full"
+name = "Full Plugin"
+version = "1.0.0"
+description = "A plugin with all the bells and whistles"
+
+[permissions]
+stanza_access = true
+event_subscriptions = ["xmpp.message.*"]
+kv_storage = true
+
+[hooks]
+stanza_processor = true
+stanza_priority = 5
+event_handler = true
+gui_metadata = true
+
+[gui]
+components = ["Settings.vue"]
+
+[assets]
+icon = "icon.svg"
+i18n_dir = "i18n/"
+"#;
+        std::fs::write(source_dir.join("manifest.toml"), manifest_toml).unwrap();
+        std::fs::write(source_dir.join("plugin.wasm"), b"fake-wasm").unwrap();
+        std::fs::write(
+            source_dir.join("vue/Settings.vue"),
+            b"<template></template>",
+        )
+        .unwrap();
+        std::fs::write(source_dir.join("assets/icon.svg"), b"<svg/>").unwrap();
+        std::fs::write(source_dir.join("assets/i18n/en.json"), b"{}").unwrap();
+
+        let registry = PluginRegistry::new(RegistryConfig::default(), data_dir).unwrap();
+        let installed = registry
+            .install(source_dir.to_str().unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(installed.id, "com.test.full");
+
+        let files = registry.get_plugin_files("com.test.full").unwrap();
+        assert!(files.vue_dir.is_some());
+        assert!(files.assets_dir.is_some());
+        assert!(files.vue_dir.unwrap().join("Settings.vue").exists());
+        assert!(files.assets_dir.as_ref().unwrap().join("icon.svg").exists());
     }
 
     impl PluginManifest {

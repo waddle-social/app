@@ -27,6 +27,9 @@ glob = { workspace = true }
 semver = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+chrono = { workspace = true }
+sha2 = "0.10"
+tar = "0.4"
 wasmtime = { workspace = true, optional = true }
 oci-distribution = { workspace = true }
 

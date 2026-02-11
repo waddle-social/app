@@ -53,7 +53,7 @@
 - [x] Implement plugin KV storage with namespace isolation (`plugin_kv` table, keyed by plugin ID) and quota enforcement.
 - [x] Implement Wasmtime runtime: fuel metering, epoch interruption, memory caps, dedicated blocking thread pool. Implement plugin lifecycle: load → init → unload, with 5-error auto-disable threshold.
 - [x] Implement plugin event and stanza integration: WIT host functions for event subscribe/publish, enforcing `plugin.{id}.*` namespace restrictions on publish.
-- [ ] Implement OCI plugin registry operations (install, uninstall, update, search/list) and local plugin index/cache management per `specs/03-components/plugins-registry.md`.
+- [x] Implement OCI plugin registry operations (install, uninstall, update, search/list) and local plugin index/cache management per `specs/03-components/plugins-registry.md`.
 
 ## 7. User Interfaces
 - [ ] Implement `waddle-tui` shell: four-panel layout (sidebar, conversation, status bar, input), keyboard input loop, event bus subscribe/publish wiring per `specs/03-components/tui-shell.md`.
