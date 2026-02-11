@@ -173,8 +173,7 @@ impl<D: Database> RosterManager<D> {
     ) -> Result<(), RosterError> {
         let jid_s = jid.to_string();
 
-        // Verify contact exists
-        let existing: Result<StoredRosterItem, _> = self
+        let existing: Result<StoredRosterItem, StorageError> = self
             .db
             .query_one(
                 "SELECT jid, name, subscription, groups FROM roster WHERE jid = ?1",
@@ -182,8 +181,11 @@ impl<D: Database> RosterManager<D> {
             )
             .await;
 
-        if existing.is_err() {
-            return Err(RosterError::ContactNotFound(jid.to_string()));
+        if let Err(error) = existing {
+            return match error {
+                StorageError::NotFound => Err(RosterError::ContactNotFound(jid.to_string())),
+                other => Err(RosterError::Storage(other)),
+            };
         }
 
         let groups_json = serde_json::to_string(groups).map_err(|e| RosterError::SetFailed {
@@ -457,6 +459,26 @@ mod tests {
             .update_contact("nobody@example.com", Some("X"), &[])
             .await;
         assert!(matches!(result, Err(RosterError::ContactNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn update_contact_propagates_storage_errors() {
+        let (manager, _, _dir) = setup().await;
+        manager
+            .add_contact("alice@example.com", Some("Alice"), &[])
+            .await
+            .unwrap();
+
+        manager.db.execute("DROP TABLE roster", &[]).await.unwrap();
+
+        let result = manager
+            .update_contact("alice@example.com", Some("Alice W"), &[])
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(RosterError::Storage(StorageError::QueryFailed(_)))
+        ));
     }
 
     #[tokio::test]
