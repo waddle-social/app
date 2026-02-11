@@ -559,6 +559,17 @@ impl<D: Database> MucManager<D> {
         Ok(())
     }
 
+    async fn persist_room_message(
+        &self,
+        room: &str,
+        message: &ChatMessage,
+    ) -> Result<(), MessagingError> {
+        let mut normalized = message.clone();
+        normalized.to = room.to_string();
+        normalized.message_type = MessageType::Groupchat;
+        self.persist_message(&normalized).await
+    }
+
     async fn mark_room_joined(&self, room: &str, nick: &str) -> Result<(), MessagingError> {
         let room_s = room.to_string();
         let nick_s = nick.to_string();
@@ -637,8 +648,8 @@ impl<D: Database> MucManager<D> {
                     from = %message.from,
                     "MUC message received, persisting"
                 );
-                if let Err(e) = self.persist_message(message).await {
-                    error!(error = %e, "failed to persist MUC message");
+                if let Err(e) = self.persist_room_message(room, message).await {
+                    error!(error = %e, room = %room, "failed to persist MUC message");
                 }
             }
             EventPayload::MucSubjectChanged { room, subject } => {
@@ -1326,6 +1337,39 @@ mod muc_tests {
         assert_eq!(messages[0].id, "muc-msg-1");
         assert_eq!(messages[0].body, "Hi all!");
         assert!(matches!(messages[0].message_type, MessageType::Groupchat));
+    }
+
+    #[tokio::test]
+    async fn handle_muc_message_received_persists_using_room_jid() {
+        let (manager, _, _dir) = setup_muc().await;
+
+        let msg = ChatMessage {
+            id: "muc-msg-user-to".to_string(),
+            from: "room@conference.example.com/Bob".to_string(),
+            to: "alice@example.com".to_string(),
+            body: "Directly addressed stanza".to_string(),
+            timestamp: Utc::now(),
+            message_type: MessageType::Groupchat,
+            thread: None,
+        };
+
+        let event = make_event(
+            "xmpp.muc.message.received",
+            EventPayload::MucMessageReceived {
+                room: "room@conference.example.com".to_string(),
+                message: msg,
+            },
+        );
+        manager.handle_event(&event).await;
+
+        let messages = manager
+            .get_room_messages("room@conference.example.com", 50, None)
+            .await
+            .unwrap();
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, "muc-msg-user-to");
+        assert_eq!(messages[0].to, "room@conference.example.com");
     }
 
     #[tokio::test]
