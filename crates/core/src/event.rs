@@ -668,4 +668,907 @@ mod tests {
         let c = Channel::new("xmpp.message.received").unwrap();
         assert_eq!(c.domain(), "xmpp");
     }
+
+    #[test]
+    fn test_channel_domain_all_domains() {
+        let cases = [
+            ("system.startup.complete", "system"),
+            ("xmpp.message.received", "xmpp"),
+            ("ui.theme.changed", "ui"),
+            ("plugin.foo.loaded", "plugin"),
+        ];
+        for (name, expected) in cases {
+            let c = Channel::new(name).unwrap();
+            assert_eq!(c.domain(), expected, "domain of {name}");
+        }
+    }
+
+    #[test]
+    fn test_channel_new_rejects_invalid() {
+        let result = Channel::new("bad.domain.event");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            crate::error::EventBusError::InvalidChannel(_)
+        ));
+    }
+
+    #[test]
+    fn test_channel_as_str_and_display() {
+        let c = Channel::new("xmpp.roster.updated").unwrap();
+        assert_eq!(c.as_str(), "xmpp.roster.updated");
+        assert_eq!(c.to_string(), "xmpp.roster.updated");
+    }
+
+    #[test]
+    fn test_channel_into_string() {
+        let c = Channel::new("ui.conversation.opened").unwrap();
+        let s: String = c.into();
+        assert_eq!(s, "ui.conversation.opened");
+    }
+
+    #[test]
+    fn test_channel_two_segment() {
+        assert!(Channel::is_valid("system.startup"));
+        let c = Channel::new("system.startup").unwrap();
+        assert_eq!(c.domain(), "system");
+    }
+
+    #[test]
+    fn test_event_new_fields() {
+        let channel = Channel::new("system.startup.complete").unwrap();
+        let event = Event::new(
+            channel.clone(),
+            EventSource::System("test".into()),
+            EventPayload::StartupComplete,
+        );
+
+        assert_eq!(event.channel, channel);
+        assert!(event.correlation_id.is_none());
+        assert!(!event.id.is_nil());
+    }
+
+    #[test]
+    fn test_event_with_correlation() {
+        let channel = Channel::new("xmpp.message.sent").unwrap();
+        let corr_id = Uuid::new_v4();
+        let event = Event::with_correlation(
+            channel,
+            EventSource::Xmpp,
+            EventPayload::MessageSent {
+                message: ChatMessage {
+                    id: "msg1".into(),
+                    from: "alice@example.com".into(),
+                    to: "bob@example.com".into(),
+                    body: "hello".into(),
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Chat,
+                    thread: None,
+                },
+            },
+            corr_id,
+        );
+
+        assert_eq!(event.correlation_id, Some(corr_id));
+    }
+
+    #[test]
+    fn test_event_unique_ids() {
+        let channel = Channel::new("system.startup.complete").unwrap();
+        let e1 = Event::new(
+            channel.clone(),
+            EventSource::System("test".into()),
+            EventPayload::StartupComplete,
+        );
+        let e2 = Event::new(
+            channel,
+            EventSource::System("test".into()),
+            EventPayload::StartupComplete,
+        );
+        assert_ne!(e1.id, e2.id);
+    }
+}
+
+#[cfg(all(test, feature = "native"))]
+mod event_bus_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    fn make_event(channel: &str, payload: EventPayload) -> Event {
+        Event::new(
+            Channel::new(channel).unwrap(),
+            EventSource::System("test".into()),
+            payload,
+        )
+    }
+
+    // ── Routing correctness ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn publish_to_system_routes_to_system_subscriber() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("system.**").unwrap();
+
+        bus.publish(make_event(
+            "system.startup.complete",
+            EventPayload::StartupComplete,
+        ))
+        .unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(event.channel.as_str(), "system.startup.complete");
+    }
+
+    #[tokio::test]
+    async fn publish_to_xmpp_routes_to_xmpp_subscriber() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("xmpp.**").unwrap();
+
+        bus.publish(make_event(
+            "xmpp.message.received",
+            EventPayload::MessageReceived {
+                message: ChatMessage {
+                    id: "m1".into(),
+                    from: "alice@example.com".into(),
+                    to: "bob@example.com".into(),
+                    body: "hi".into(),
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Chat,
+                    thread: None,
+                },
+            },
+        ))
+        .unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(event.channel.as_str(), "xmpp.message.received");
+    }
+
+    #[tokio::test]
+    async fn publish_to_ui_routes_to_ui_subscriber() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("ui.**").unwrap();
+
+        bus.publish(make_event(
+            "ui.theme.changed",
+            EventPayload::ThemeChanged {
+                theme_id: "dark".into(),
+            },
+        ))
+        .unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(event.channel.as_str(), "ui.theme.changed");
+    }
+
+    #[tokio::test]
+    async fn publish_to_plugin_routes_to_plugin_subscriber() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("plugin.**").unwrap();
+
+        bus.publish(make_event(
+            "plugin.foo.loaded",
+            EventPayload::PluginLoaded {
+                plugin_id: "foo".into(),
+                version: "1.0".into(),
+            },
+        ))
+        .unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(event.channel.as_str(), "plugin.foo.loaded");
+    }
+
+    #[tokio::test]
+    async fn xmpp_event_not_received_by_system_subscriber() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("system.**").unwrap();
+
+        bus.publish(make_event(
+            "xmpp.message.received",
+            EventPayload::MessageReceived {
+                message: ChatMessage {
+                    id: "m1".into(),
+                    from: "a@b".into(),
+                    to: "c@d".into(),
+                    body: "test".into(),
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Chat,
+                    thread: None,
+                },
+            },
+        ))
+        .unwrap();
+
+        let result = timeout(Duration::from_millis(50), sub.recv()).await;
+        assert!(
+            result.is_err(),
+            "system subscriber should not receive xmpp events"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_succeeds_with_no_subscribers() {
+        let bus = BroadcastEventBus::default();
+        let result = bus.publish(make_event(
+            "system.startup.complete",
+            EventPayload::StartupComplete,
+        ));
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn multiple_subscribers_same_domain_each_get_event() {
+        let bus = BroadcastEventBus::default();
+        let mut sub1 = bus.subscribe("xmpp.**").unwrap();
+        let mut sub2 = bus.subscribe("xmpp.**").unwrap();
+
+        bus.publish(make_event(
+            "xmpp.roster.updated",
+            EventPayload::RosterUpdated {
+                item: RosterItem {
+                    jid: "alice@example.com".into(),
+                    name: Some("Alice".into()),
+                    subscription: Subscription::Both,
+                    groups: vec![],
+                },
+            },
+        ))
+        .unwrap();
+
+        let e1 = timeout(Duration::from_millis(100), sub1.recv())
+            .await
+            .expect("sub1 timed out")
+            .unwrap();
+        let e2 = timeout(Duration::from_millis(100), sub2.recv())
+            .await
+            .expect("sub2 timed out")
+            .unwrap();
+
+        assert_eq!(e1.channel.as_str(), "xmpp.roster.updated");
+        assert_eq!(e2.channel.as_str(), "xmpp.roster.updated");
+        assert_eq!(e1.id, e2.id);
+    }
+
+    // ── Glob filtering ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn glob_star_matches_single_segment() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("xmpp.message.*").unwrap();
+
+        bus.publish(make_event(
+            "xmpp.message.received",
+            EventPayload::MessageReceived {
+                message: ChatMessage {
+                    id: "m1".into(),
+                    from: "a@b".into(),
+                    to: "c@d".into(),
+                    body: "test".into(),
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Chat,
+                    thread: None,
+                },
+            },
+        ))
+        .unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(event.channel.as_str(), "xmpp.message.received");
+    }
+
+    #[tokio::test]
+    async fn glob_doublestar_matches_all_depths() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("xmpp.**").unwrap();
+
+        bus.publish(make_event(
+            "xmpp.message.received",
+            EventPayload::MessageReceived {
+                message: ChatMessage {
+                    id: "m1".into(),
+                    from: "a@b".into(),
+                    to: "c@d".into(),
+                    body: "test".into(),
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Chat,
+                    thread: None,
+                },
+            },
+        ))
+        .unwrap();
+        bus.publish(make_event(
+            "xmpp.roster.updated",
+            EventPayload::RosterUpdated {
+                item: RosterItem {
+                    jid: "a@b".into(),
+                    name: None,
+                    subscription: Subscription::None,
+                    groups: vec![],
+                },
+            },
+        ))
+        .unwrap();
+
+        let e1 = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        let e2 = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+
+        assert_eq!(e1.channel.as_str(), "xmpp.message.received");
+        assert_eq!(e2.channel.as_str(), "xmpp.roster.updated");
+    }
+
+    #[tokio::test]
+    async fn glob_filters_non_matching_channels_within_domain() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("xmpp.roster.*").unwrap();
+
+        // Publish a message event (should not match roster pattern)
+        bus.publish(make_event(
+            "xmpp.message.received",
+            EventPayload::MessageReceived {
+                message: ChatMessage {
+                    id: "m1".into(),
+                    from: "a@b".into(),
+                    to: "c@d".into(),
+                    body: "test".into(),
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Chat,
+                    thread: None,
+                },
+            },
+        ))
+        .unwrap();
+
+        // Publish a roster event (should match)
+        bus.publish(make_event(
+            "xmpp.roster.updated",
+            EventPayload::RosterUpdated {
+                item: RosterItem {
+                    jid: "a@b".into(),
+                    name: None,
+                    subscription: Subscription::None,
+                    groups: vec![],
+                },
+            },
+        ))
+        .unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(event.channel.as_str(), "xmpp.roster.updated");
+    }
+
+    #[tokio::test]
+    async fn wildcard_first_segment_receives_all_domains() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("**.received").unwrap();
+
+        bus.publish(make_event(
+            "xmpp.message.received",
+            EventPayload::MessageReceived {
+                message: ChatMessage {
+                    id: "m1".into(),
+                    from: "a@b".into(),
+                    to: "c@d".into(),
+                    body: "test".into(),
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Chat,
+                    thread: None,
+                },
+            },
+        ))
+        .unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(event.channel.as_str(), "xmpp.message.received");
+    }
+
+    #[tokio::test]
+    async fn firehose_doublestar_receives_everything() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("**").unwrap();
+
+        bus.publish(make_event(
+            "system.startup.complete",
+            EventPayload::StartupComplete,
+        ))
+        .unwrap();
+        bus.publish(make_event(
+            "xmpp.message.received",
+            EventPayload::MessageReceived {
+                message: ChatMessage {
+                    id: "m1".into(),
+                    from: "a@b".into(),
+                    to: "c@d".into(),
+                    body: "hi".into(),
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Chat,
+                    thread: None,
+                },
+            },
+        ))
+        .unwrap();
+        bus.publish(make_event(
+            "ui.theme.changed",
+            EventPayload::ThemeChanged {
+                theme_id: "dark".into(),
+            },
+        ))
+        .unwrap();
+        bus.publish(make_event(
+            "plugin.foo.loaded",
+            EventPayload::PluginLoaded {
+                plugin_id: "foo".into(),
+                version: "1.0".into(),
+            },
+        ))
+        .unwrap();
+
+        let mut channels = Vec::new();
+        for _ in 0..4 {
+            let event = timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .expect("timed out")
+                .unwrap();
+            channels.push(event.channel.as_str().to_string());
+        }
+
+        channels.sort();
+        assert_eq!(
+            channels,
+            vec![
+                "plugin.foo.loaded",
+                "system.startup.complete",
+                "ui.theme.changed",
+                "xmpp.message.received",
+            ]
+        );
+    }
+
+    // ── Subscribe error cases ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn subscribe_invalid_pattern_returns_error() {
+        let bus = BroadcastEventBus::default();
+        let result = bus.subscribe("[invalid");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn subscribe_empty_pattern_returns_error() {
+        let bus = BroadcastEventBus::default();
+        let result = bus.subscribe("");
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn subscribe_unknown_literal_domain_returns_error() {
+        let bus = BroadcastEventBus::default();
+        let result = bus.subscribe("unknown.domain.event");
+        assert!(matches!(
+            result,
+            Err(crate::error::EventBusError::InvalidPattern(_))
+        ));
+    }
+
+    // ── Per-domain ordering ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn events_within_domain_preserve_publish_order() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("xmpp.**").unwrap();
+
+        for i in 0..10 {
+            bus.publish(make_event(
+                "xmpp.message.received",
+                EventPayload::MessageReceived {
+                    message: ChatMessage {
+                        id: format!("msg{i}"),
+                        from: "a@b".into(),
+                        to: "c@d".into(),
+                        body: format!("message {i}"),
+                        timestamp: Utc::now(),
+                        message_type: MessageType::Chat,
+                        thread: None,
+                    },
+                },
+            ))
+            .unwrap();
+        }
+
+        for i in 0..10 {
+            let event = timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .expect("timed out")
+                .unwrap();
+            match &event.payload {
+                EventPayload::MessageReceived { message } => {
+                    assert_eq!(message.id, format!("msg{i}"), "out of order at index {i}");
+                }
+                _ => panic!("unexpected payload"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn events_across_different_domains_are_all_delivered() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("**").unwrap();
+
+        bus.publish(make_event(
+            "system.startup.complete",
+            EventPayload::StartupComplete,
+        ))
+        .unwrap();
+        bus.publish(make_event(
+            "xmpp.roster.updated",
+            EventPayload::RosterUpdated {
+                item: RosterItem {
+                    jid: "a@b".into(),
+                    name: None,
+                    subscription: Subscription::None,
+                    groups: vec![],
+                },
+            },
+        ))
+        .unwrap();
+        bus.publish(make_event(
+            "ui.conversation.opened",
+            EventPayload::ConversationOpened { jid: "a@b".into() },
+        ))
+        .unwrap();
+
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            let event = timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .expect("timed out")
+                .unwrap();
+            received.push(event.channel.as_str().to_string());
+        }
+
+        received.sort();
+        assert_eq!(
+            received,
+            vec![
+                "system.startup.complete",
+                "ui.conversation.opened",
+                "xmpp.roster.updated",
+            ]
+        );
+    }
+
+    // ── Correlation ID tracking ───────────────────────────────────
+
+    #[tokio::test]
+    async fn correlated_events_share_correlation_id() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("xmpp.**").unwrap();
+
+        let corr_id = Uuid::new_v4();
+
+        bus.publish(Event::with_correlation(
+            Channel::new("xmpp.message.sent").unwrap(),
+            EventSource::Ui(UiTarget::Tui),
+            EventPayload::MessageSent {
+                message: ChatMessage {
+                    id: "m1".into(),
+                    from: "alice@example.com".into(),
+                    to: "bob@example.com".into(),
+                    body: "hello".into(),
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Chat,
+                    thread: None,
+                },
+            },
+            corr_id,
+        ))
+        .unwrap();
+
+        bus.publish(Event::with_correlation(
+            Channel::new("xmpp.message.delivered").unwrap(),
+            EventSource::Xmpp,
+            EventPayload::MessageDelivered {
+                id: "m1".into(),
+                to: "bob@example.com".into(),
+            },
+            corr_id,
+        ))
+        .unwrap();
+
+        let e1 = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        let e2 = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+
+        assert_eq!(e1.correlation_id, Some(corr_id));
+        assert_eq!(e2.correlation_id, Some(corr_id));
+        assert_ne!(e1.id, e2.id);
+    }
+
+    #[tokio::test]
+    async fn events_without_correlation_have_none() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("system.**").unwrap();
+
+        bus.publish(make_event(
+            "system.startup.complete",
+            EventPayload::StartupComplete,
+        ))
+        .unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert!(event.correlation_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn correlation_id_filter_across_subscriber() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("xmpp.**").unwrap();
+
+        let target_corr = Uuid::new_v4();
+        let other_corr = Uuid::new_v4();
+
+        bus.publish(Event::with_correlation(
+            Channel::new("xmpp.message.sent").unwrap(),
+            EventSource::Xmpp,
+            EventPayload::MessageSent {
+                message: ChatMessage {
+                    id: "m1".into(),
+                    from: "a@b".into(),
+                    to: "c@d".into(),
+                    body: "hello".into(),
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Chat,
+                    thread: None,
+                },
+            },
+            target_corr,
+        ))
+        .unwrap();
+
+        bus.publish(Event::with_correlation(
+            Channel::new("xmpp.message.sent").unwrap(),
+            EventSource::Xmpp,
+            EventPayload::MessageSent {
+                message: ChatMessage {
+                    id: "m2".into(),
+                    from: "a@b".into(),
+                    to: "c@d".into(),
+                    body: "world".into(),
+                    timestamp: Utc::now(),
+                    message_type: MessageType::Chat,
+                    thread: None,
+                },
+            },
+            other_corr,
+        ))
+        .unwrap();
+
+        bus.publish(Event::with_correlation(
+            Channel::new("xmpp.message.delivered").unwrap(),
+            EventSource::Xmpp,
+            EventPayload::MessageDelivered {
+                id: "m1".into(),
+                to: "c@d".into(),
+            },
+            target_corr,
+        ))
+        .unwrap();
+
+        let mut target_events = Vec::new();
+        for _ in 0..3 {
+            let event = timeout(Duration::from_millis(100), sub.recv())
+                .await
+                .expect("timed out")
+                .unwrap();
+            if event.correlation_id == Some(target_corr) {
+                target_events.push(event);
+            }
+        }
+
+        assert_eq!(target_events.len(), 2);
+        assert_eq!(target_events[0].channel.as_str(), "xmpp.message.sent");
+        assert_eq!(target_events[1].channel.as_str(), "xmpp.message.delivered");
+    }
+
+    // ── Lagged subscriber recovery ────────────────────────────────
+
+    #[tokio::test]
+    async fn lagged_subscriber_returns_lagged_error() {
+        let bus = BroadcastEventBus::new(2);
+        let mut sub = bus.subscribe("system.**").unwrap();
+
+        // Overflow the small buffer
+        for i in 0..10 {
+            bus.publish(make_event(
+                "system.startup.complete",
+                EventPayload::ErrorOccurred {
+                    component: "test".into(),
+                    message: format!("event {i}"),
+                    recoverable: true,
+                },
+            ))
+            .unwrap();
+        }
+
+        let result = sub.recv().await;
+        assert!(
+            matches!(result, Err(crate::error::EventBusError::Lagged(_))),
+            "expected Lagged error, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscriber_recovers_after_lag() {
+        let bus = BroadcastEventBus::new(2);
+        let mut sub = bus.subscribe("system.**").unwrap();
+
+        // Overflow to cause lag
+        for i in 0..5 {
+            bus.publish(make_event(
+                "system.startup.complete",
+                EventPayload::ErrorOccurred {
+                    component: "test".into(),
+                    message: format!("old {i}"),
+                    recoverable: true,
+                },
+            ))
+            .unwrap();
+        }
+
+        // First recv should return Lagged
+        let result = sub.recv().await;
+        assert!(matches!(
+            result,
+            Err(crate::error::EventBusError::Lagged(_))
+        ));
+
+        // Drain any remaining buffered events
+        loop {
+            match timeout(Duration::from_millis(10), sub.recv()).await {
+                Ok(Ok(_)) => continue,
+                Ok(Err(crate::error::EventBusError::Lagged(_))) => continue,
+                _ => break,
+            }
+        }
+
+        // Publish a new event after the lag
+        bus.publish(make_event(
+            "system.config.reloaded",
+            EventPayload::ConfigReloaded,
+        ))
+        .unwrap();
+
+        // Subscriber should recover and receive new events
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out after lag recovery")
+            .unwrap();
+        assert_eq!(event.channel.as_str(), "system.config.reloaded");
+    }
+
+    // ── Channel closed ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn channel_closed_when_bus_dropped() {
+        let mut sub;
+        {
+            let bus = BroadcastEventBus::default();
+            sub = bus.subscribe("system.**").unwrap();
+        }
+
+        let result = sub.recv().await;
+        assert!(matches!(
+            result,
+            Err(crate::error::EventBusError::ChannelClosed)
+        ));
+    }
+
+    // ── BroadcastEventBus construction ────────────────────────────
+
+    #[tokio::test]
+    async fn default_construction_works() {
+        let bus = BroadcastEventBus::default();
+        let mut sub = bus.subscribe("system.**").unwrap();
+
+        bus.publish(make_event(
+            "system.startup.complete",
+            EventPayload::StartupComplete,
+        ))
+        .unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(event.channel.as_str(), "system.startup.complete");
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_clamped_to_one() {
+        let bus = BroadcastEventBus::new(0);
+        let mut sub = bus.subscribe("system.**").unwrap();
+
+        bus.publish(make_event(
+            "system.startup.complete",
+            EventPayload::StartupComplete,
+        ))
+        .unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(event.channel.as_str(), "system.startup.complete");
+    }
+
+    // ── EventBus trait usage ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn trait_object_publish_and_subscribe() {
+        let bus: Box<dyn EventBus> = Box::new(BroadcastEventBus::default());
+        let mut sub = bus.subscribe("system.**").unwrap();
+
+        bus.publish(make_event(
+            "system.startup.complete",
+            EventPayload::StartupComplete,
+        ))
+        .unwrap();
+
+        let event = timeout(Duration::from_millis(100), sub.recv())
+            .await
+            .expect("timed out")
+            .unwrap();
+        assert_eq!(event.channel.as_str(), "system.startup.complete");
+    }
+
+    // ── has_glob_meta ─────────────────────────────────────────────
+
+    #[test]
+    fn has_glob_meta_detects_metacharacters() {
+        assert!(has_glob_meta("*"));
+        assert!(has_glob_meta("?"));
+        assert!(has_glob_meta("[a]"));
+        assert!(has_glob_meta("{a,b}"));
+        assert!(has_glob_meta("!foo"));
+        assert!(has_glob_meta("**"));
+        assert!(!has_glob_meta("xmpp"));
+        assert!(!has_glob_meta("system"));
+        assert!(!has_glob_meta("plain123"));
+    }
 }
