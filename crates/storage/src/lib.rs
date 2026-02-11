@@ -9,12 +9,15 @@ use std::{
 
 #[cfg(feature = "native")]
 use rusqlite::{
-    Connection, params_from_iter,
+    Connection, params, params_from_iter,
     types::{Value, ValueRef},
 };
 
 #[cfg(feature = "native")]
 use tokio::{sync::oneshot, task};
+
+#[cfg(feature = "native")]
+use tracing::info;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
@@ -336,6 +339,82 @@ fn query_rows(
 }
 
 #[cfg(feature = "native")]
+struct Migration {
+    version: u32,
+    sql: &'static str,
+}
+
+#[cfg(feature = "native")]
+const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    sql: include_str!("../migrations/001_initial.sql"),
+}];
+
+#[cfg(feature = "native")]
+fn run_migrations(connection: &Connection) -> Result<(), StorageError> {
+    connection
+        .execute_batch(
+            "CREATE TABLE IF NOT EXISTS _migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );",
+        )
+        .map_err(|error| StorageError::MigrationFailed {
+            version: 0,
+            reason: format!("failed to create _migrations table: {error}"),
+        })?;
+
+    let applied_version: u32 = connection
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM _migrations",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| StorageError::MigrationFailed {
+            version: 0,
+            reason: format!("failed to query migration state: {error}"),
+        })?;
+
+    for migration in MIGRATIONS {
+        if migration.version <= applied_version {
+            continue;
+        }
+
+        let tx =
+            connection
+                .unchecked_transaction()
+                .map_err(|error| StorageError::MigrationFailed {
+                    version: migration.version,
+                    reason: format!("failed to begin transaction: {error}"),
+                })?;
+
+        tx.execute_batch(migration.sql)
+            .map_err(|error| StorageError::MigrationFailed {
+                version: migration.version,
+                reason: error.to_string(),
+            })?;
+
+        tx.execute(
+            "INSERT INTO _migrations (version) VALUES (?1)",
+            params![migration.version],
+        )
+        .map_err(|error| StorageError::MigrationFailed {
+            version: migration.version,
+            reason: format!("failed to record migration: {error}"),
+        })?;
+
+        tx.commit().map_err(|error| StorageError::MigrationFailed {
+            version: migration.version,
+            reason: format!("failed to commit migration: {error}"),
+        })?;
+
+        info!(version = migration.version, "applied migration");
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "native")]
 fn run_writer(path: PathBuf, receiver: Receiver<WriteCommand>) {
     let mut state = match open_native_connection(&path) {
         Ok(connection) => WriterState::Ready(connection),
@@ -369,12 +448,16 @@ impl NativeDatabase {
         let path = path.to_path_buf();
         let setup_path = path.clone();
 
-        task::spawn_blocking(move || open_native_connection(&setup_path).map(drop))
-            .await
-            .map_err(|error| StorageError::ConnectionFailed {
-                path: path.clone(),
-                reason: format!("failed to join native storage setup task: {error}"),
-            })??;
+        task::spawn_blocking(move || {
+            let connection = open_native_connection(&setup_path)?;
+            run_migrations(&connection)?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| StorageError::ConnectionFailed {
+            path: path.clone(),
+            reason: format!("failed to join native storage setup task: {error}"),
+        })??;
 
         let (writer, receiver) = mpsc::channel();
         let writer_path = path.clone();
