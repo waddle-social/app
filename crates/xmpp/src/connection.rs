@@ -143,14 +143,20 @@ where
 
     pub async fn enable_carbons(&mut self) -> Result<(), ConnectionError> {
         if let Some(iq) = self.carbons_manager.enable() {
-            self.send_raw(&iq, false).await?;
+            if let Err(error) = self.send_raw(&iq, false).await {
+                self.carbons_manager.on_enable_result(false);
+                return Err(error);
+            }
         }
         Ok(())
     }
 
     pub async fn disable_carbons(&mut self) -> Result<(), ConnectionError> {
         if let Some(iq) = self.carbons_manager.disable() {
-            self.send_raw(&iq, false).await?;
+            if let Err(error) = self.send_raw(&iq, false).await {
+                self.carbons_manager.on_disable_result(false);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -170,14 +176,20 @@ where
 
     pub async fn set_csi_inactive(&mut self) -> Result<(), ConnectionError> {
         if let Some(stanza) = self.csi_manager.set_inactive() {
-            self.send_raw(&stanza, false).await?;
+            if let Err(error) = self.send_raw(&stanza, false).await {
+                let _ = self.csi_manager.set_active();
+                return Err(error);
+            }
         }
         Ok(())
     }
 
     pub async fn set_csi_active(&mut self) -> Result<(), ConnectionError> {
         if let Some(stanza) = self.csi_manager.set_active() {
-            self.send_raw(&stanza, false).await?;
+            if let Err(error) = self.send_raw(&stanza, false).await {
+                let _ = self.csi_manager.set_inactive();
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -452,6 +464,36 @@ mod tests {
             ConnectionManager::<DummyTransport>::reconnect_delay(99),
             Duration::from_secs(60)
         );
+    }
+
+    fn config(max_reconnect_attempts: u32) -> ConnectionConfig {
+        ConnectionConfig {
+            jid: "alice@example.com".to_string(),
+            password: "password".to_string(),
+            server: Some("xmpp.example.com".to_string()),
+            port: Some(5222),
+            timeout_seconds: 30,
+            max_reconnect_attempts,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enable_carbons_while_disconnected_rolls_back_state() {
+        let mut manager = ConnectionManager::<DummyTransport>::new(config(0));
+
+        let result = manager.enable_carbons().await;
+        assert!(matches!(result, Err(ConnectionError::TransportError(_))));
+        assert_eq!(manager.carbons_state(), CarbonsState::Disabled);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn set_csi_inactive_while_disconnected_rolls_back_state() {
+        let mut manager = ConnectionManager::<DummyTransport>::new(config(0));
+        manager.set_csi_server_support(true);
+
+        let result = manager.set_csi_inactive().await;
+        assert!(matches!(result, Err(ConnectionError::TransportError(_))));
+        assert_eq!(manager.csi_state(), ClientState::Active);
     }
 }
 
