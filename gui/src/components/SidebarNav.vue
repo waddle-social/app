@@ -1,17 +1,22 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useRouter, useRoute } from 'vue-router';
 import { storeToRefs } from 'pinia';
 
 import { useConversations } from '../composables/useConversations';
 import { useRuntimeStore } from '../stores/runtime';
+import { useAuthStore } from '../stores/auth';
+import { useRoomsStore } from '../stores/rooms';
 
 const router = useRouter();
 const route = useRoute();
 const runtimeStore = useRuntimeStore();
+const authStore = useAuthStore();
+const roomsStore = useRoomsStore();
 const { connectionStatus } = storeToRefs(runtimeStore);
 
 const { conversations } = useConversations();
+const { joinedRooms } = storeToRefs(roomsStore);
 
 const directJid = ref('');
 
@@ -57,6 +62,10 @@ function openDirectMessage(): void {
   openChat(jid);
 }
 
+function roomLocalpart(jid: string): string {
+  return jid.split('@')[0] || jid;
+}
+
 function formatTime(value: string | null): string {
   if (!value) return '';
   const date = new Date(value);
@@ -75,6 +84,23 @@ const statusDotClass = computed(() => {
     case 'offline': return 'bg-danger';
     default: return 'bg-muted';
   }
+});
+
+const joinedRoomList = computed(() => Array.from(joinedRooms.value));
+
+async function handleLogout(): Promise<void> {
+  await authStore.logout();
+  roomsStore.reset();
+  void router.replace('/login');
+}
+
+// Start room discovery when sidebar mounts (user is authenticated)
+onMounted(() => {
+  roomsStore.startListening();
+});
+
+onUnmounted(() => {
+  roomsStore.stopListening();
 });
 </script>
 
@@ -98,6 +124,16 @@ const statusDotClass = computed(() => {
         Contacts
       </RouterLink>
       <RouterLink
+        to="/rooms"
+        class="flex items-center gap-2 rounded px-2 py-1.5 text-sm text-muted transition-colors hover:bg-hover hover:text-foreground"
+        active-class="!bg-active !text-foreground"
+      >
+        <svg class="h-4 w-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M7 20l4-16m2 16l4-16M6 9h14M4 15h14" />
+        </svg>
+        Rooms
+      </RouterLink>
+      <RouterLink
         to="/settings"
         class="flex items-center gap-2 rounded px-2 py-1.5 text-sm text-muted transition-colors hover:bg-hover hover:text-foreground"
         active-class="!bg-active !text-foreground"
@@ -108,6 +144,23 @@ const statusDotClass = computed(() => {
         </svg>
         Settings
       </RouterLink>
+    </div>
+
+    <!-- Rooms section -->
+    <div v-if="joinedRoomList.length > 0" class="flex flex-col px-2 pt-2">
+      <span class="mb-1 px-2 text-xs font-semibold uppercase tracking-wide text-muted">Rooms</span>
+      <ul class="flex flex-col gap-0.5">
+        <li v-for="roomJid in joinedRoomList" :key="roomJid">
+          <button
+            class="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-sm transition-colors hover:bg-hover"
+            :class="isActiveChat(roomJid) ? 'bg-active text-foreground' : 'text-muted'"
+            @click="openChat(roomJid)"
+          >
+            <span class="text-base">#</span>
+            <span class="truncate">{{ roomLocalpart(roomJid) }}</span>
+          </button>
+        </li>
+      </ul>
     </div>
 
     <!-- DM section header -->
@@ -162,10 +215,21 @@ const statusDotClass = computed(() => {
       </form>
     </nav>
 
-    <!-- Connection status footer -->
-    <div class="flex items-center gap-2 border-t border-border px-3 py-2">
-      <span class="h-2 w-2 rounded-full" :class="statusDotClass"></span>
-      <span class="text-xs text-muted capitalize">{{ connectionStatus }}</span>
+    <!-- Connection status + logout footer -->
+    <div class="flex items-center justify-between border-t border-border px-3 py-2">
+      <div class="flex items-center gap-2">
+        <span class="h-2 w-2 rounded-full" :class="statusDotClass"></span>
+        <span class="text-xs text-muted capitalize">{{ connectionStatus }}</span>
+      </div>
+      <button
+        class="rounded px-2 py-1 text-xs text-muted transition-colors hover:bg-hover hover:text-foreground"
+        title="Sign out"
+        @click="handleLogout"
+      >
+        <svg class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+        </svg>
+      </button>
     </div>
   </aside>
 </template>

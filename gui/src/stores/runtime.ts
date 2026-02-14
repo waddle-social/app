@@ -22,7 +22,7 @@ interface BackendEventEnvelope {
 }
 
 export const useRuntimeStore = defineStore('runtime', () => {
-  const connectionStatus = ref<ConnectionStatus>('connecting');
+  const connectionStatus = ref<ConnectionStatus>('offline');
   const connectionMessage = ref<string | null>(null);
   const reconnectAttempt = ref<number | null>(null);
 
@@ -32,21 +32,12 @@ export const useRuntimeStore = defineStore('runtime', () => {
   const unlistenFns: UnlistenFn[] = [];
 
   function setMessageDelivery(id: string, status: MessageDeliveryStatus): void {
-    if (!id) {
-      return;
-    }
-
-    messageDeliveryById.value = {
-      ...messageDeliveryById.value,
-      [id]: status,
-    };
+    if (!id) return;
+    messageDeliveryById.value = { ...messageDeliveryById.value, [id]: status };
   }
 
   function clearMessageDelivery(id: string): void {
-    if (!id || !messageDeliveryById.value[id]) {
-      return;
-    }
-
+    if (!id || !messageDeliveryById.value[id]) return;
     const next = { ...messageDeliveryById.value };
     delete next[id];
     messageDeliveryById.value = next;
@@ -65,9 +56,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
   function setReconnecting(attempt: number | null): void {
     connectionStatus.value = 'reconnecting';
     reconnectAttempt.value = attempt;
-    connectionMessage.value = attempt
-      ? `Reconnecting (attempt ${attempt})`
-      : 'Reconnecting';
+    connectionMessage.value = attempt ? `Reconnecting (attempt ${attempt})` : 'Reconnecting';
   }
 
   function setOffline(reason: string | null): void {
@@ -101,9 +90,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
 
   function handleSystemEvent(envelope: BackendEventEnvelope): void {
     const payload = envelope.payload;
-    if (!payload?.type) {
-      return;
-    }
+    if (!payload?.type) return;
 
     switch (payload.type) {
       case 'connectionEstablished': {
@@ -118,9 +105,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
         return;
       }
       case 'comingOnline': {
-        if (connectionStatus.value !== 'connected') {
-          setConnecting();
-        }
+        if (connectionStatus.value !== 'connected') setConnecting();
         return;
       }
       case 'connectionLost': {
@@ -134,9 +119,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
       }
       case 'errorOccurred': {
         const message = typeof payload.data?.message === 'string' ? payload.data.message : null;
-        if (message) {
-          connectionMessage.value = message;
-        }
+        if (message) connectionMessage.value = message;
         return;
       }
       default:
@@ -146,33 +129,20 @@ export const useRuntimeStore = defineStore('runtime', () => {
 
   function handleMessageSent(envelope: BackendEventEnvelope): void {
     const payload = envelope.payload;
-    if (payload?.type !== 'messageSent') {
-      return;
-    }
-
+    if (payload?.type !== 'messageSent') return;
     const message = payload.data?.message as ChatMessage | undefined;
-    if (message?.id) {
-      setMessageDelivery(message.id, 'sent');
-    }
+    if (message?.id) setMessageDelivery(message.id, 'sent');
   }
 
   function handleMessageDelivered(envelope: BackendEventEnvelope): void {
     const payload = envelope.payload;
-    if (payload?.type !== 'messageDelivered') {
-      return;
-    }
-
+    if (payload?.type !== 'messageDelivered') return;
     const id = typeof payload.data?.id === 'string' ? payload.data.id : null;
-    if (id) {
-      setMessageDelivery(id, 'delivered');
-    }
+    if (id) setMessageDelivery(id, 'delivered');
   }
 
   async function bootstrap(): Promise<void> {
-    if (bootstrapped) {
-      return;
-    }
-
+    if (bootstrapped) return;
     bootstrapped = true;
 
     const waddle = useWaddle();
@@ -189,30 +159,32 @@ export const useRuntimeStore = defineStore('runtime', () => {
     ];
 
     for (const channel of subscriptions) {
-      const unlisten = await waddle.listen<BackendEventEnvelope>(channel, ({ payload }) => {
-        if (channel.startsWith('system.')) {
-          handleSystemEvent(payload);
-          return;
-        }
-
-        if (channel === 'xmpp.message.sent') {
-          handleMessageSent(payload);
-          return;
-        }
-
-        if (channel === 'xmpp.message.delivered') {
-          handleMessageDelivered(payload);
-        }
-      });
-
-      unlistenFns.push(unlisten);
+      try {
+        const unlisten = await waddle.listen<BackendEventEnvelope>(channel, ({ payload }) => {
+          if (channel.startsWith('system.')) {
+            handleSystemEvent(payload);
+            return;
+          }
+          if (channel === 'xmpp.message.sent') {
+            handleMessageSent(payload);
+            return;
+          }
+          if (channel === 'xmpp.message.delivered') {
+            handleMessageDelivered(payload);
+          }
+        });
+        unlistenFns.push(unlisten);
+      } catch {
+        // Transport not ready yet — tolerate gracefully
+      }
     }
 
     try {
       const snapshot = await waddle.getConnectionState();
       applyConnectionSnapshot(snapshot);
     } catch {
-      // Keep optimistic "connecting" state when snapshot probing is unavailable.
+      // Not connected yet — stay in 'offline' state
+      setOffline('Not signed in');
     }
   }
 
@@ -222,6 +194,10 @@ export const useRuntimeStore = defineStore('runtime', () => {
       unlisten?.();
     }
     bootstrapped = false;
+    connectionStatus.value = 'offline';
+    connectionMessage.value = null;
+    reconnectAttempt.value = null;
+    messageDeliveryById.value = {};
   }
 
   return {

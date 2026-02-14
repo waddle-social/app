@@ -64,7 +64,10 @@ export const useConversationsStore = defineStore('conversations', () => {
         return left.title.localeCompare(right.title);
       });
     } catch (cause) {
-      error.value = cause instanceof Error ? cause.message : String(cause);
+      // Tolerate disconnected state — don't overwrite existing conversations
+      if (conversations.value.length === 0) {
+        error.value = cause instanceof Error ? cause.message : String(cause);
+      }
     } finally {
       loading.value = false;
     }
@@ -88,9 +91,13 @@ export const useConversationsStore = defineStore('conversations', () => {
     for (const channel of conversationEvents) {
       void listen(channel, () => {
         void refreshConversations();
-      }).then((unlisten) => {
-        unlistenFns.push(unlisten);
-      });
+      })
+        .then((unlisten) => {
+          unlistenFns.push(unlisten);
+        })
+        .catch(() => {
+          // Transport not ready — tolerate gracefully
+        });
     }
   }
 

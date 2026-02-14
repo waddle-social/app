@@ -100,8 +100,12 @@ const unlistenFns: UnlistenFn[] = [];
 onMounted(async () => {
   await refreshRoster();
   for (const channel of rosterEvents) {
-    const unlisten = await listen(channel, () => { void refreshRoster(); });
-    unlistenFns.push(unlisten);
+    try {
+      const unlisten = await listen(channel, () => { void refreshRoster(); });
+      unlistenFns.push(unlisten);
+    } catch {
+      // Channel not supported by transport — tolerate gracefully
+    }
   }
 });
 

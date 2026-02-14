@@ -3,13 +3,20 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useRoute } from 'vue-router';
 
+import { useRouter } from 'vue-router';
 import { type ChatMessage, type UnlistenFn, useWaddle } from '../composables/useWaddle';
 import { useRuntimeStore, type MessageDeliveryStatus } from '../stores/runtime';
+import { useRoomsStore } from '../stores/rooms';
+import { useAuthStore } from '../stores/auth';
 
 const route = useRoute();
+const router = useRouter();
 const { getHistory, listen, sendMessage } = useWaddle();
 const runtimeStore = useRuntimeStore();
+const roomsStore = useRoomsStore();
+const authStore = useAuthStore();
 const { connectionStatus } = storeToRefs(runtimeStore);
+const { joinedRooms } = storeToRefs(roomsStore);
 
 function decodeRouteJid(value: string): string {
   try {
@@ -20,6 +27,8 @@ function decodeRouteJid(value: string): string {
 }
 
 const jid = computed(() => decodeRouteJid(String(route.params.jid ?? '')));
+
+const isRoom = computed(() => joinedRooms.value.has(jid.value));
 
 const displayName = computed(() => {
   const j = jid.value;
@@ -74,6 +83,12 @@ function bareJid(value: string): string {
 }
 
 function isOutbound(message: ChatMessage): boolean {
+  if (isRoom.value) {
+    // MUC: outbound if the nick in from (room@conf/nick) matches our nick.
+    // Our nick is the localpart of our JID (used by the rooms store when joining).
+    const nick = message.from.split('/')[1];
+    return !!nick && nick === authStore.nickname;
+  }
   const toBare = bareJid(message.to);
   return toBare === jid.value;
 }
@@ -81,7 +96,33 @@ function isOutbound(message: ChatMessage): boolean {
 function senderName(message: ChatMessage): string {
   if (isOutbound(message)) return 'You';
   const from = message.from || jid.value;
+  // For MUC, the resource part is the nick (from is room@conf/nick)
+  if (isRoom.value) {
+    const resource = from.split('/')[1];
+    if (resource) return resource;
+  }
   return from.split('@')[0] || from;
+}
+
+/**
+ * Resolve a MUC sender's nick to a bare JID for DM.
+ * In semi-anonymous MUC rooms the real JID isn't exposed, so we infer
+ * nick@domain using the logged-in user's server domain.
+ */
+function senderBareJid(message: ChatMessage): string | null {
+  if (!isRoom.value) return null;
+  if (isOutbound(message)) return null;
+  const nick = message.from.split('/')[1];
+  if (!nick) return null;
+  const domain = authStore.jid.split('@')[1];
+  if (!domain) return null;
+  return `${nick}@${domain}`;
+}
+
+function openDmWithSender(message: ChatMessage): void {
+  const targetJid = senderBareJid(message);
+  if (!targetJid) return;
+  void router.push(`/chat/${encodeURIComponent(targetJid)}`);
 }
 
 function getAvatarColor(name: string): string {
@@ -106,6 +147,8 @@ function defaultOutboundStatus(): MessageDeliveryStatus {
 
 function deliveryStatusFor(message: ChatMessage): MessageDeliveryStatus | null {
   if (!isOutbound(message)) return null;
+  // No delivery receipts in MUC
+  if (isRoom.value) return null;
   return runtimeStore.deliveryFor(message.id) ?? 'sent';
 }
 
@@ -118,19 +161,16 @@ function deliveryIcon(status: MessageDeliveryStatus | null): string {
   }
 }
 
-/** Should this message show a full header (avatar, name, timestamp) or be compact? */
 function showHeader(index: number): boolean {
   if (index === 0) return true;
   const prev = messages.value[index - 1];
   const curr = messages.value[index];
   if (!prev || !curr) return true;
   if (senderName(prev) !== senderName(curr)) return true;
-  // Group messages within 5 minutes
   const gap = Date.parse(curr.timestamp) - Date.parse(prev.timestamp);
   return gap > 5 * 60 * 1000;
 }
 
-/** Should we show a date separator before this message? */
 function showDateSeparator(index: number): boolean {
   if (index === 0) return true;
   const prevMessage = messages.value[index - 1];
@@ -142,6 +182,7 @@ function showDateSeparator(index: number): boolean {
 }
 
 function seedOutboundStatuses(history: ChatMessage[]): void {
+  if (isRoom.value) return;
   for (const message of history) {
     if (!isOutbound(message) || runtimeStore.deliveryFor(message.id)) continue;
     runtimeStore.setMessageDelivery(message.id, 'sent');
@@ -185,8 +226,11 @@ async function submitMessage(): Promise<void> {
   draft.value = '';
 
   try {
-    const sent = await sendMessage(jid.value, body);
-    runtimeStore.setMessageDelivery(sent.id, defaultOutboundStatus());
+    const msgType = isRoom.value ? 'groupchat' : 'chat';
+    const sent = await sendMessage(jid.value, body, msgType);
+    if (!isRoom.value) {
+      runtimeStore.setMessageDelivery(sent.id, defaultOutboundStatus());
+    }
     messages.value = sortMessages([...messages.value, sent]);
     scrollToBottom();
   } catch (cause) {
@@ -214,7 +258,6 @@ function maybeRefreshForEvent(event: BackendEventEnvelope): void {
   const toBare = bareJid(message.to);
 
   if (fromBare === jid.value || toBare === jid.value) {
-    // Directly append the message to avoid race with DB persistence
     const alreadyPresent = messages.value.some((existing) => existing.id === message.id);
     if (!alreadyPresent) {
       messages.value = sortMessages([...messages.value, message]);
@@ -224,29 +267,57 @@ function maybeRefreshForEvent(event: BackendEventEnvelope): void {
 }
 
 let stopMessageListener: UnlistenFn | null = null;
+let historyReloadTimer: ReturnType<typeof setTimeout> | null = null;
 
 onMounted(async () => {
   await runtimeStore.bootstrap();
+
+  // Set up the message listener FIRST so we don't miss messages
   stopMessageListener = await listen<BackendEventEnvelope>('xmpp.message.received', ({ payload }) => {
     maybeRefreshForEvent(payload);
   });
+
+  // Now load history (catches anything already in the transport's buffer)
+  await loadHistory();
+
+  // For MUC rooms, schedule a re-load after a short delay to catch
+  // history messages that may still be arriving from the server.
+  if (isRoom.value) {
+    historyReloadTimer = setTimeout(() => { void loadHistory(); }, 1500);
+  }
 });
 
 onUnmounted(() => {
   stopMessageListener?.();
   stopMessageListener = null;
+  if (historyReloadTimer) {
+    clearTimeout(historyReloadTimer);
+    historyReloadTimer = null;
+  }
 });
 
-watch(jid, () => { void loadHistory(); }, { immediate: true });
+watch(jid, () => {
+  // Clear the reload timer when switching conversations
+  if (historyReloadTimer) {
+    clearTimeout(historyReloadTimer);
+    historyReloadTimer = null;
+  }
+  void loadHistory();
+  // Re-schedule reload for MUC rooms
+  if (isRoom.value) {
+    historyReloadTimer = setTimeout(() => { void loadHistory(); }, 1500);
+  }
+});
 </script>
 
 <template>
   <div class="flex h-full flex-col">
     <!-- Channel header bar -->
     <header class="flex h-12 flex-shrink-0 items-center border-b border-border px-4 shadow-sm">
-      <span class="mr-2 text-xl text-muted">@</span>
+      <span class="mr-2 text-xl text-muted">{{ isRoom ? '#' : '@' }}</span>
       <h2 class="text-base font-semibold text-foreground">{{ displayName }}</h2>
       <span class="ml-3 hidden text-sm text-muted sm:inline">{{ jid }}</span>
+      <span v-if="isRoom" class="ml-2 rounded bg-surface-raised px-2 py-0.5 text-[10px] text-muted">Room</span>
     </header>
 
     <!-- Error banner -->
@@ -263,10 +334,17 @@ watch(jid, () => { void loadHistory(); }, { immediate: true });
           class="mb-4 flex h-16 w-16 items-center justify-center rounded-full text-2xl font-bold text-white"
           :style="{ backgroundColor: getAvatarColor(jid) }"
         >
-          {{ getInitials(displayName) }}
+          {{ isRoom ? '#' : getInitials(displayName) }}
         </div>
         <h3 class="text-xl font-semibold text-foreground">{{ displayName }}</h3>
-        <p class="mt-1 text-sm text-muted">This is the beginning of your direct message history with <strong>{{ displayName }}</strong>.</p>
+        <p class="mt-1 text-sm text-muted">
+          <template v-if="isRoom">
+            This is the beginning of <strong>#{{ displayName }}</strong>.
+          </template>
+          <template v-else>
+            This is the beginning of your direct message history with <strong>{{ displayName }}</strong>.
+          </template>
+        </p>
       </div>
 
       <template v-else>
@@ -287,13 +365,22 @@ watch(jid, () => { void loadHistory(); }, { immediate: true });
             <div v-if="showHeader(index)" class="flex gap-4">
               <div
                 class="mt-0.5 flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-full text-sm font-semibold text-white"
+                :class="senderBareJid(message) ? 'cursor-pointer ring-0 transition-all hover:ring-2 hover:ring-accent' : ''"
                 :style="{ backgroundColor: getAvatarColor(senderName(message)) }"
+                :title="senderBareJid(message) ? `DM ${senderBareJid(message)}` : undefined"
+                @click="openDmWithSender(message)"
               >
                 {{ getInitials(senderName(message)) }}
               </div>
               <div class="min-w-0 flex-1">
                 <div class="flex items-baseline gap-2">
-                  <span class="text-sm font-semibold" :style="{ color: getAvatarColor(senderName(message)) }">
+                  <span
+                    class="text-sm font-semibold"
+                    :class="senderBareJid(message) ? 'cursor-pointer hover:underline' : ''"
+                    :style="{ color: getAvatarColor(senderName(message)) }"
+                    :title="senderBareJid(message) ? `DM ${senderBareJid(message)}` : undefined"
+                    @click="openDmWithSender(message)"
+                  >
                     {{ senderName(message) }}
                   </span>
                   <span class="text-[11px] text-muted">{{ formatTime(message.timestamp) }}</span>
@@ -330,7 +417,7 @@ watch(jid, () => { void loadHistory(); }, { immediate: true });
         <input
           v-model="draft"
           type="text"
-          :placeholder="`Message @${displayName}`"
+          :placeholder="isRoom ? `Message #${displayName}` : `Message @${displayName}`"
           class="min-w-0 flex-1 bg-transparent px-4 py-3 text-sm text-foreground placeholder-muted outline-none"
           autocomplete="off"
           @keydown="handleKeydown"
